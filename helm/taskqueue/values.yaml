@@ -1,0 +1,63 @@
+replicaCount: 2
+
+image:
+  repository: taskqueue
+  tag: latest
+  pullPolicy: IfNotPresent
+
+infrastructure:
+  kafka:
+    brokers: "kafka:9092"
+  redis:
+    host: "redis"
+    port: 6379
+  postgres:
+    url: "postgresql://taskqueue:taskqueue@postgres:5432/taskqueue"
+
+auth:
+  jwtSecret: "change-me-in-production"
+
+apiGateway:
+  port: 3000
+
+notifier:
+  port: 3400
+
+metricsExporter:
+  port: 3500
+
+workers:
+  email:
+    maxConcurrency: 5
+    minReplicas: 2
+    maxReplicas: 20
+    redisQueueThreshold: 10
+  image:
+    maxConcurrency: 3
+    minReplicas: 2
+    maxReplicas: 15
+    redisQueueThreshold: 5
+  data:
+    maxConcurrency: 8
+    minReplicas: 2
+    maxReplicas: 30
+    redisQueueThreshold: 15
+
+resources:
+  apiGateway:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  scheduler:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+keda:
+  enabled: true

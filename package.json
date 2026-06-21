@@ -1,0 +1,36 @@
+{
+  "name": "taskqueue",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Distributed Task Queue & Worker Orchestration Platform",
+  "scripts": {
+    "dev:api": "pnpm --filter @taskqueue/api-gateway dev",
+    "dev:scheduler": "pnpm --filter @taskqueue/scheduler dev",
+    "dev:state-manager": "pnpm --filter @taskqueue/state-manager dev",
+    "dev:notifier": "pnpm --filter @taskqueue/notifier dev",
+    "dev:metrics": "pnpm --filter @taskqueue/metrics-exporter dev",
+    "dev:worker-email": "pnpm --filter @taskqueue/worker-email dev",
+    "dev:worker-image": "pnpm --filter @taskqueue/worker-image dev",
+    "dev:worker-data": "pnpm --filter @taskqueue/worker-data dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "clean": "pnpm -r exec rm -rf dist node_modules/.cache"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "prettier": "^3.4.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "sharp"]
+  }
+}

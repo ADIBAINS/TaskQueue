@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: state-manager
+  labels:
+    app: taskqueue
+    service: state-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: state-manager
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: state-manager
+    spec:
+      initContainers:
+        - name: migrate
+          image: taskqueue/state-manager:latest
+          command: ["node", "services/state-manager/dist/run-migrate.js"]
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+      containers:
+        - name: state-manager
+          image: taskqueue/state-manager:latest
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+          env:
+            - name: SERVICE_NAME
+              value: state-manager
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: state-manager
+  labels:
+    service: state-manager
+spec:
+  selector:
+    service: state-manager
+  ports:
+    - port: 3300
+      targetPort: 3300
+      name: metrics

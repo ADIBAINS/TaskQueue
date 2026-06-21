@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-data
+  labels:
+    app: taskqueue
+    service: worker-data
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      service: worker-data
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: worker-data
+    spec:
+      containers:
+        - name: worker-data
+          image: taskqueue/worker-data:latest
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+          env:
+            - name: SERVICE_NAME
+              value: worker-data
+            - name: MAX_CONCURRENCY
+              value: "8"
+          resources:
+            requests:
+              cpu: 150m
+              memory: 192Mi
+            limits:
+              cpu: 750m
+              memory: 768Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-data
+  labels:
+    service: worker-data
+spec:
+  selector:
+    service: worker-data
+  ports:
+    - port: 3602
+      targetPort: 3602
+      name: metrics
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-data-scaler
+spec:
+  scaleTargetRef:
+    name: worker-data
+  pollingInterval: 15
+  cooldownPeriod: 30
+  minReplicaCount: 2
+  maxReplicaCount: 30
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: queue:data
+        listLength: "15"

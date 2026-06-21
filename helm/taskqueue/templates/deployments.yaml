@@ -1,0 +1,116 @@
+{{- $root := . -}}
+{{- range $svc := list "api-gateway" "scheduler" "state-manager" "notifier" "metrics-exporter" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $svc }}
+  labels:
+    app.kubernetes.io/name: {{ $root.Chart.Name }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    service: {{ $svc }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: {{ $svc }}
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: {{ $svc }}
+    spec:
+      containers:
+        - name: {{ $svc }}
+          image: "{{ $root.Values.image.repository }}/{{ $svc }}:{{ $root.Values.image.tag }}"
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ $root.Release.Name }}-config
+            - secretRef:
+                name: {{ $root.Release.Name }}-secrets
+          env:
+            - name: SERVICE_NAME
+              value: {{ $svc }}
+            - name: PORT
+              value: {{ index $root.Values (regexReplaceAll "-" $svc "") | quote }}
+          ports:
+            {{- if or (eq $svc "api-gateway") (eq $svc "notifier") (eq $svc "metrics-exporter") }}
+            - containerPort: {{ index (dict "api-gateway" $root.Values.apiGateway.port "notifier" $root.Values.notifier.port "metrics-exporter" $root.Values.metricsExporter.port) $svc }}
+            {{- end }}
+          resources:
+            {{- toYaml $root.Values.resources.apiGateway | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  labels:
+    service: {{ $svc }}
+spec:
+  selector:
+    service: {{ $svc }}
+  ports:
+    - port: {{ index (dict "api-gateway" $root.Values.apiGateway.port "notifier" $root.Values.notifier.port "metrics-exporter" $root.Values.metricsExporter.port "scheduler" 3200 "state-manager" 3300) $svc }}
+      targetPort: {{ index (dict "api-gateway" $root.Values.apiGateway.port "notifier" $root.Values.notifier.port "metrics-exporter" $root.Values.metricsExporter.port "scheduler" 3200 "state-manager" 3300) $svc }}
+{{ end }}
+---
+{{- range $type, $cfg := $root.Values.workers }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-{{ $type }}
+  labels:
+    app.kubernetes.io/name: {{ $root.Chart.Name }}
+    service: worker-{{ $type }}
+spec:
+  replicas: {{ $cfg.minReplicas }}
+  selector:
+    matchLabels:
+      service: worker-{{ $type }}
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: worker-{{ $type }}
+    spec:
+      containers:
+        - name: worker-{{ $type }}
+          image: "{{ $root.Values.image.repository }}/worker-{{ $type }}:{{ $root.Values.image.tag }}"
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ $root.Release.Name }}-config
+            - secretRef:
+                name: {{ $root.Release.Name }}-secrets
+          env:
+            - name: SERVICE_NAME
+              value: worker-{{ $type }}
+            - name: MAX_CONCURRENCY
+              value: {{ $cfg.maxConcurrency | quote }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-{{ $type }}-scaler
+spec:
+  scaleTargetRef:
+    name: worker-{{ $type }}
+  pollingInterval: 15
+  cooldownPeriod: 30
+  minReplicaCount: {{ $cfg.minReplicas }}
+  maxReplicaCount: {{ $cfg.maxReplicas }}
+  triggers:
+    - type: redis
+      metadata:
+        address: {{ $root.Values.infrastructure.redis.host }}:{{ $root.Values.infrastructure.redis.port }}
+        listName: queue:{{ $type }}
+        listLength: {{ $cfg.redisQueueThreshold | quote }}
+{{ end }}

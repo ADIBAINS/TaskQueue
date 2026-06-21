@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-email
+  labels:
+    app: taskqueue
+    service: worker-email
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      service: worker-email
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: worker-email
+    spec:
+      containers:
+        - name: worker-email
+          image: taskqueue/worker-email:latest
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+          env:
+            - name: SERVICE_NAME
+              value: worker-email
+            - name: MAX_CONCURRENCY
+              value: "5"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-email
+  labels:
+    service: worker-email
+spec:
+  selector:
+    service: worker-email
+  ports:
+    - port: 3600
+      targetPort: 3600
+      name: metrics
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-email-scaler
+spec:
+  scaleTargetRef:
+    name: worker-email
+  pollingInterval: 15
+  cooldownPeriod: 30
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: queue:email
+        listLength: "10"

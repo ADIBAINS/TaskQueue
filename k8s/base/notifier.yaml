@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier
+  labels:
+    app: taskqueue
+    service: notifier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      service: notifier
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: notifier
+    spec:
+      containers:
+        - name: notifier
+          image: taskqueue/notifier:latest
+          ports:
+            - containerPort: 3400
+              name: ws
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+          env:
+            - name: SERVICE_NAME
+              value: notifier
+            - name: PORT
+              value: "3400"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notifier
+  labels:
+    service: notifier
+spec:
+  selector:
+    service: notifier
+  ports:
+    - port: 3400
+      targetPort: 3400
+      name: ws

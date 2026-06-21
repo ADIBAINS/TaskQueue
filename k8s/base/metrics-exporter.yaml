@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-exporter
+  labels:
+    app: taskqueue
+    service: metrics-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      service: metrics-exporter
+  template:
+    metadata:
+      labels:
+        app: taskqueue
+        service: metrics-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3500"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: metrics-exporter
+          image: taskqueue/metrics-exporter:latest
+          ports:
+            - containerPort: 3500
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: taskqueue-config
+            - secretRef:
+                name: taskqueue-secrets
+          env:
+            - name: SERVICE_NAME
+              value: metrics-exporter
+            - name: PORT
+              value: "3500"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-exporter
+  labels:
+    service: metrics-exporter
+spec:
+  selector:
+    service: metrics-exporter
+  ports:
+    - port: 3500
+      targetPort: 3500
+      name: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taskqueue-metrics
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      service: metrics-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
