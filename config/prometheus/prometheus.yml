@@ -3,34 +3,26 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: "api-gateway"
+  - job_name: 'scheduler'
     static_configs:
-      - targets: ["host.docker.internal:3100"]
+      - targets: ['host.docker.internal:3200']
 
-  - job_name: "scheduler"
+  - job_name: 'state-manager'
     static_configs:
-      - targets: ["host.docker.internal:3200"]
+      - targets: ['host.docker.internal:3300']
 
-  - job_name: "state-manager"
+  - job_name: 'metrics-exporter'
     static_configs:
-      - targets: ["host.docker.internal:3300"]
+      - targets: ['host.docker.internal:3500']
 
-  - job_name: "notifier"
+  - job_name: 'worker-email'
     static_configs:
-      - targets: ["host.docker.internal:3400"]
+      - targets: ['host.docker.internal:3600']
 
-  - job_name: "metrics-exporter"
+  - job_name: 'worker-image'
     static_configs:
-      - targets: ["host.docker.internal:3500"]
+      - targets: ['host.docker.internal:3601']
 
-  - job_name: "worker-email"
+  - job_name: 'worker-data'
     static_configs:
-      - targets: ["host.docker.internal:3600"]
-
-  - job_name: "worker-image"
-    static_configs:
-      - targets: ["host.docker.internal:3601"]
-
-  - job_name: "worker-data"
-    static_configs:
-      - targets: ["host.docker.internal:3602"]
+      - targets: ['host.docker.internal:3602']

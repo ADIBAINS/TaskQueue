@@ -108,6 +108,18 @@ describe('PriorityQueue', () => {
     expect(queue.peek()).toBeNull();
   });
 
+  it('removes a queued job by ID', () => {
+    queue.enqueue(makeJob('a', 1));
+    queue.enqueue(makeJob('b', 3));
+    queue.enqueue(makeJob('c', 2));
+
+    expect(queue.remove('b')).toBe(true);
+    expect(queue.remove('missing')).toBe(false);
+    expect(queue.size()).toBe(2);
+    expect(queue.dequeue()?.job.id).toBe('a');
+    expect(queue.dequeue()?.job.id).toBe('c');
+  });
+
   it('toArray returns a copy of the heap', () => {
     queue.enqueue(makeJob('a', 1));
     queue.enqueue(makeJob('b', 3));

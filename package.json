@@ -12,8 +12,9 @@
     "dev:worker-email": "pnpm --filter @taskqueue/worker-email dev",
     "dev:worker-image": "pnpm --filter @taskqueue/worker-image dev",
     "dev:worker-data": "pnpm --filter @taskqueue/worker-data dev",
+    "taskqueue": "pnpm --filter @taskqueue/cli exec node --import tsx src/index.ts",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter @taskqueue/shared build && pnpm -r typecheck",
     "test": "pnpm -r test",
     "lint": "pnpm -r lint",
     "docker:build": "docker compose build",
@@ -29,8 +30,5 @@
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "sharp"]
   }
 }

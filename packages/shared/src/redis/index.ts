@@ -42,7 +42,11 @@ export function getRedisClient(config: RedisConfig): Redis {
  * Set a worker heartbeat key with a TTL.
  * Workers call this every ~5 seconds to signal they're alive.
  */
-export async function heartbeat(redis: Redis, workerId: string, ttlSeconds: number = 15): Promise<void> {
+export async function heartbeat(
+  redis: Redis,
+  workerId: string,
+  ttlSeconds: number = 15,
+): Promise<void> {
   await redis.set(`heartbeat:${workerId}`, Date.now().toString(), 'EX', ttlSeconds);
 }
 

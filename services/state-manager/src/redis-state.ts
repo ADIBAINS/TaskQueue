@@ -44,7 +44,23 @@ export class RedisStateStore {
    * Update the full cached job state, syncing all mutable fields.
    * Called after PostgreSQL mutations to keep Redis consistent.
    */
-  async updateJobFull(jobId: string, updates: Partial<Pick<Job, 'status' | 'retryCount' | 'workerId' | 'startedAt' | 'completedAt' | 'failedAt' | 'errorMessage' | 'onSuccess' | 'onFailure'>>): Promise<void> {
+  async updateJobFull(
+    jobId: string,
+    updates: Partial<
+      Pick<
+        Job,
+        | 'status'
+        | 'retryCount'
+        | 'workerId'
+        | 'startedAt'
+        | 'completedAt'
+        | 'failedAt'
+        | 'errorMessage'
+        | 'onSuccess'
+        | 'onFailure'
+      >
+    >,
+  ): Promise<void> {
     const job = await this.getJobState(jobId);
     if (job) {
       Object.assign(job, updates);

@@ -10,6 +10,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ${{ github.repository }}
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   typecheck:
     name: TypeScript Type Check
@@ -27,7 +31,7 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r typecheck
+      - run: pnpm typecheck
 
   test:
     name: Tests

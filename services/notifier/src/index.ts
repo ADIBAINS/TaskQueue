@@ -40,7 +40,7 @@ export async function startNotifier(config: NotifierConfig): Promise<void> {
   const clients = new Map<string, ClientSubscription>();
 
   wss.on('connection', (ws, req) => {
-    const clientId = req.headers['x-client-id'] as string || `client_${Date.now()}`;
+    const clientId = (req.headers['x-client-id'] as string) || `client_${Date.now()}`;
     const subscription: ClientSubscription = {
       ws,
       jobIds: new Set(),
@@ -134,7 +134,9 @@ export async function startNotifier(config: NotifierConfig): Promise<void> {
 
 // Self-invocation entrypoint
 initTracing('notifier', process.env.OTLP_ENDPOINT);
-process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+process.on('SIGTERM', () => {
+  shutdownTracing().catch(() => {});
+});
 
 const PORT = parseInt(process.env.PORT || '3400', 10);
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:29092').split(',');

@@ -53,4 +53,4 @@ export function getCorrelationId(): string | null {
   return correlationStore.getStore()?.correlationId ?? null;
 }
 
-export { pino };	
+export { pino };

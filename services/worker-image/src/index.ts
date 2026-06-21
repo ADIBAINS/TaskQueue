@@ -37,7 +37,10 @@ startWorker(config, async (job: Job) => {
 
   const supportedFormats = ['jpeg', 'png', 'webp', 'avif'];
   if (!supportedFormats.includes(targetFormat)) {
-    return { success: false, error: `Unsupported format: ${targetFormat}. Supported: ${supportedFormats.join(', ')}` };
+    return {
+      success: false,
+      error: `Unsupported format: ${targetFormat}. Supported: ${supportedFormats.join(', ')}`,
+    };
   }
 
   if (targetWidth < 1 || targetWidth > 10000 || targetHeight < 1 || targetHeight > 10000) {

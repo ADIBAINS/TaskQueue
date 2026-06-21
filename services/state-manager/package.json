@@ -7,7 +7,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "migrate": "tsx src/migrate.ts",
-    "test": "node --experimental-vm-modules --import tsx node_modules/.bin/vitest run",
+    "test": "vitest run --passWithNoTests",
     "lint": "prettier --check src/"
   },
   "dependencies": {

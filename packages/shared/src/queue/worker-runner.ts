@@ -72,7 +72,10 @@ export class Semaphore {
 /**
  * Heartbeat loop that signals the worker is alive every 5 seconds.
  */
-function startHeartbeat(redis: ReturnType<typeof getRedisClient>, workerId: string): NodeJS.Timeout {
+function startHeartbeat(
+  redis: ReturnType<typeof getRedisClient>,
+  workerId: string,
+): NodeJS.Timeout {
   return setInterval(async () => {
     try {
       await heartbeat(redis, workerId, 15);
@@ -91,19 +94,32 @@ async function processJob(
   producer: Producer,
   redis: ReturnType<typeof getRedisClient>,
   workerType: JobType,
-  execute: (job: Job) => Promise<{ success: boolean; result?: Record<string, unknown>; error?: string }>,
+  execute: (
+    job: Job,
+  ) => Promise<{ success: boolean; result?: Record<string, unknown>; error?: string }>,
 ): Promise<void> {
   const startTime = Date.now();
   log.info({ jobId: job.id, type: job.type, workerId }, 'Processing job');
 
-  const lockKey = `lock:job:${job.id}`;
-  const locked = await redis.set(lockKey, workerId, 'EX', 60, 'NX');
-  if (locked !== 'OK') {
+  const queue = new WorkerQueue(redis, workerType);
+  const cached = await redis.get(`job:state:${job.id}`);
+  if (cached && (JSON.parse(cached) as Job).status === 'CANCELLED') {
+    log.info({ jobId: job.id }, 'Skipping cancelled job');
+    return;
+  }
+
+  const locked = await queue.acquireLock(job.id, workerId, 60);
+  if (!locked) {
     log.warn({ jobId: job.id }, 'Job already locked by another worker');
     return;
   }
 
+  const processingKey = `processing:job:${job.id}`;
+  let lockExtender: NodeJS.Timeout | undefined;
+
   try {
+    await redis.set(processingKey, workerId, 'EX', 86400);
+
     await publishMessage(producer, KAFKA_TOPICS.JOB_STATE_CHANGE, job.id, {
       jobId: job.id,
       previousStatus: 'QUEUED',
@@ -113,15 +129,21 @@ async function processJob(
       correlationId: job.correlationId,
     });
 
-    const lockExtender = setInterval(async () => {
-      await redis.expire(lockKey, 60);
+    lockExtender = setInterval(() => {
+      queue.extendLock(job.id, workerId, 60).catch((err) => {
+        log.error({ err, jobId: job.id, workerId }, 'Failed to extend job lock');
+      });
     }, 15000);
 
     const result = await execute(job);
-    clearInterval(lockExtender);
 
     const duration = Date.now() - startTime;
-    await redis.set(`metrics:${workerType}:job_duration:${job.id}`, duration.toString(), 'EX', 3600);
+    await redis.set(
+      `metrics:${workerType}:job_duration:${job.id}`,
+      duration.toString(),
+      'EX',
+      3600,
+    );
 
     if (result.success) {
       await publishMessage(producer, KAFKA_TOPICS.JOB_COMPLETED, job.id, {
@@ -137,6 +159,7 @@ async function processJob(
         await handleJobChaining(job.onSuccess, producer, job.correlationId);
       }
     } else {
+      await redis.incr(`metrics:${workerType}:failed`);
       await publishMessage(producer, KAFKA_TOPICS.JOB_FAILED, job.id, {
         jobId: job.id,
         workerType,
@@ -153,6 +176,7 @@ async function processJob(
     const errorMessage = err instanceof Error ? err.message : 'Unknown error';
     log.error({ err, jobId: job.id, workerId }, 'Job processing failed');
 
+    await redis.incr(`metrics:${workerType}:failed`);
     await publishMessage(producer, KAFKA_TOPICS.JOB_FAILED, job.id, {
       jobId: job.id,
       workerType,
@@ -161,7 +185,11 @@ async function processJob(
       metadata: { workerId },
     });
   } finally {
-    await redis.del(lockKey);
+    if (lockExtender) {
+      clearInterval(lockExtender);
+    }
+    await redis.del(processingKey);
+    await queue.releaseLock(job.id, workerId);
   }
 }
 
@@ -195,13 +223,19 @@ async function handleJobChaining(
     updatedAt: new Date().toISOString(),
   });
 
-  log.info({ parentCorrelationId: correlationId, nextJobId: nextJob.id, nextType: nextJob.type }, 'Chained job submitted');
+  log.info(
+    { parentCorrelationId: correlationId, nextJobId: nextJob.id, nextType: nextJob.type },
+    'Chained job submitted',
+  );
 }
 
 /**
  * Reclaim orphaned jobs — jobs locked by dead workers with expired locks.
  */
-async function reclaimOrphans(redis: ReturnType<typeof getRedisClient>, workerType: JobType): Promise<void> {
+async function reclaimOrphans(
+  redis: ReturnType<typeof getRedisClient>,
+  workerType: JobType,
+): Promise<void> {
   const queue = new WorkerQueue(redis, workerType);
   const expired = await queue.findExpiredLocks();
 
@@ -209,11 +243,17 @@ async function reclaimOrphans(redis: ReturnType<typeof getRedisClient>, workerTy
     log.warn({ count: expired.length, workerType }, 'Reclaiming orphaned jobs');
 
     for (const jobId of expired) {
+      const claimed = await redis.set(`reclaim:job:${jobId}`, '1', 'EX', 30, 'NX');
+      if (claimed !== 'OK') continue;
+
       const cached = await redis.get(`job:state:${jobId}`);
       if (cached) {
         const job: Job = JSON.parse(cached);
-        await queue.enqueue(job);
+        if (!['SUCCESS', 'DEAD', 'CANCELLED'].includes(job.status)) {
+          await queue.enqueue(job);
+        }
       }
+      await redis.del(`processing:job:${jobId}`);
     }
   }
 }
@@ -230,7 +270,9 @@ async function reclaimOrphans(redis: ReturnType<typeof getRedisClient>, workerTy
  */
 export async function startWorker(
   config: WorkerConfig,
-  execute: (job: Job) => Promise<{ success: boolean; result?: Record<string, unknown>; error?: string }>,
+  execute: (
+    job: Job,
+  ) => Promise<{ success: boolean; result?: Record<string, unknown>; error?: string }>,
 ): Promise<void> {
   const redis = getRedisClient(config.redis);
   const producer = await getProducer(config.kafka);
@@ -239,7 +281,9 @@ export async function startWorker(
   const workerId = `${config.workerType}-worker-${uuidv4().slice(0, 8)}`;
 
   initTracing(`${config.workerType}-worker`, process.env.OTLP_ENDPOINT);
-  process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+  process.on('SIGTERM', () => {
+    shutdownTracing().catch(() => {});
+  });
 
   const metricsServer = createMetricsServer(
     config.metricsPort,
@@ -248,7 +292,10 @@ export async function startWorker(
   );
   log.info({ workerId, metricsPort: config.metricsPort }, 'Worker metrics server started');
 
-  log.info({ workerId, type: config.workerType, maxConcurrency: config.maxConcurrency }, 'Worker started');
+  log.info(
+    { workerId, type: config.workerType, maxConcurrency: config.maxConcurrency },
+    'Worker started',
+  );
 
   const heartbeatTimer = startHeartbeat(redis, workerId);
 
@@ -269,8 +316,10 @@ export async function startWorker(
           continue;
         }
 
-        processJob(job, workerId, producer, redis, config.workerType, execute)
-          .finally(() => semaphore.release());
+        await redis.incr(`metrics:${config.workerType}:dequeued`);
+        processJob(job, workerId, producer, redis, config.workerType, execute).finally(() =>
+          semaphore.release(),
+        );
       } catch (err) {
         semaphore.release();
         log.error({ err }, 'Work loop error, releasing semaphore');
@@ -313,21 +362,21 @@ async function collectWorkerMetrics(
       name: 'taskqueue_jobs_enqueued_total',
       help: 'Total enqueued in worker queue',
       type: 'counter',
-      value: parseInt(enqueued as string || '0', 10),
+      value: parseInt((enqueued as string) || '0', 10),
       labels: { queue: workerType },
     },
     {
       name: 'taskqueue_jobs_dequeued_total',
       help: 'Total dequeued from worker queue',
       type: 'counter',
-      value: parseInt(dequeued as string || '0', 10),
+      value: parseInt((dequeued as string) || '0', 10),
       labels: { queue: workerType },
     },
     {
       name: 'taskqueue_jobs_failed_total',
       help: 'Total failed jobs',
       type: 'counter',
-      value: parseInt(failed as string || '0', 10),
+      value: parseInt((failed as string) || '0', 10),
       labels: { queue: workerType },
     },
     {

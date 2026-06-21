@@ -7,18 +7,24 @@ image:
 
 infrastructure:
   kafka:
-    brokers: "kafka:9092"
+    brokers: 'kafka:9092'
   redis:
-    host: "redis"
+    host: 'redis'
     port: 6379
   postgres:
-    url: "postgresql://taskqueue:taskqueue@postgres:5432/taskqueue"
+    url: 'postgresql://taskqueue:taskqueue@postgres:5432/taskqueue'
 
 auth:
-  jwtSecret: "change-me-in-production"
+  jwtSecret: 'change-me-in-production'
 
 apiGateway:
   port: 3000
+
+scheduler:
+  port: 3200
+
+stateManager:
+  port: 3300
 
 notifier:
   port: 3400
@@ -44,19 +50,12 @@ workers:
     redisQueueThreshold: 15
 
 resources:
-  apiGateway:
+  default:
     requests:
       cpu: 100m
       memory: 128Mi
     limits:
       cpu: 500m
-      memory: 256Mi
-  scheduler:
-    requests:
-      cpu: 200m
-      memory: 256Mi
-    limits:
-      cpu: 1000m
       memory: 512Mi
 
 keda:

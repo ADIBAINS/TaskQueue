@@ -15,7 +15,15 @@ import {
   initTracing,
   shutdownTracing,
 } from '@taskqueue/shared';
-import type { KafkaConfig, RedisConfig, Job, EnqueuedJob, JobType, JobPriority, CronJob } from '@taskqueue/shared';
+import type {
+  KafkaConfig,
+  RedisConfig,
+  Job,
+  EnqueuedJob,
+  JobType,
+  JobPriority,
+  CronJob,
+} from '@taskqueue/shared';
 
 const log = createLogger('scheduler');
 
@@ -72,12 +80,20 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
   let consumer: Consumer;
 
   // --- Kafka Consumer ---
-  const handler = async ({ message }: { topic: string; message: { key?: Buffer | null; value?: Buffer | null } }) => {
+  const handler = async ({
+    message,
+  }: {
+    topic: string;
+    message: { key?: Buffer | null; value?: Buffer | null };
+  }) => {
     try {
       const value = JSON.parse(message.value?.toString() ?? '{}');
       const job = value as Job;
 
-      log.info({ jobId: job.id, type: job.type, priority: job.priority }, 'Received job for scheduling');
+      log.info(
+        { jobId: job.id, type: job.type, priority: job.priority },
+        'Received job for scheduling',
+      );
 
       // Check if this is a delayed/scheduled job
       if (job.scheduledAt) {
@@ -88,7 +104,17 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
           enqueuedAt: Date.now(),
         };
         await delayedQueue.add(enqueued, executeAt);
-        log.info({ jobId: job.id, executeAt: new Date(executeAt).toISOString() }, 'Job added to delayed queue');
+        await publishMessage(producer, KAFKA_TOPICS.JOB_STATE_CHANGE, job.id, {
+          jobId: job.id,
+          previousStatus: 'PENDING',
+          newStatus: 'SCHEDULED',
+          timestamp: new Date().toISOString(),
+          correlationId: job.correlationId,
+        });
+        log.info(
+          { jobId: job.id, executeAt: new Date(executeAt).toISOString() },
+          'Job added to delayed queue',
+        );
         return;
       }
 
@@ -108,11 +134,28 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
     }
   };
 
-  // We also need to handle retries from the state-change topic
-  const retryHandler = async ({ message }: { topic: string; message: { key?: Buffer | null; value?: Buffer | null } }) => {
+  // Handle retries and cancellation from the state-change topic.
+  const stateChangeHandler = async ({
+    message,
+  }: {
+    topic: string;
+    message: { key?: Buffer | null; value?: Buffer | null };
+  }) => {
     try {
       const value = JSON.parse(message.value?.toString() ?? '{}');
       const { jobId, newStatus, previousStatus } = value;
+
+      if (newStatus === 'CANCELLED') {
+        priorityQueue.remove(jobId);
+        await Promise.all([
+          delayedQueue.remove(jobId),
+          queues.email.remove(jobId),
+          queues.image.remove(jobId),
+          queues.data.remove(jobId),
+        ]);
+        log.info({ jobId }, 'Cancelled job removed from scheduler queues');
+        return;
+      }
 
       if (newStatus !== 'FAILED' || previousStatus !== 'RUNNING') return;
 
@@ -128,7 +171,15 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
         const enqueued: EnqueuedJob = { job, priority: job.priority, enqueuedAt: Date.now() };
 
         await delayedQueue.add(enqueued, executeAt);
-        log.info({ jobId, retryCount: job.retryCount, delay, executeAt: new Date(executeAt).toISOString() }, 'Job queued for retry with exponential backoff');
+        log.info(
+          {
+            jobId,
+            retryCount: job.retryCount,
+            delay,
+            executeAt: new Date(executeAt).toISOString(),
+          },
+          'Job queued for retry with exponential backoff',
+        );
       } else {
         // Max retries exceeded — publish to DLQ flow
         log.warn({ jobId, retryCount: job.retryCount }, 'Job exceeded max retries, routing to DLQ');
@@ -152,7 +203,7 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
       if (payload.topic === KAFKA_TOPICS.JOB_SUBMITTED) {
         await handler(payload);
       } else if (payload.topic === KAFKA_TOPICS.JOB_STATE_CHANGE) {
-        await retryHandler(payload);
+        await stateChangeHandler(payload);
       }
     },
   );
@@ -182,6 +233,11 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
         const item = priorityQueue.dequeue();
         if (!item) break;
 
+        const cached = await redis.get(`job:state:${item.job.id}`);
+        if (cached && (JSON.parse(cached) as Job).status === 'CANCELLED') {
+          continue;
+        }
+
         const workerQueue = queues[item.job.type];
         if (workerQueue) {
           await workerQueue.enqueue(item.job);
@@ -194,6 +250,13 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
             workerType: item.job.type,
             priority: item.priority,
             assignedAt: new Date().toISOString(),
+          });
+          await publishMessage(producer, KAFKA_TOPICS.JOB_STATE_CHANGE, item.job.id, {
+            jobId: item.job.id,
+            previousStatus: item.job.scheduledAt ? 'SCHEDULED' : 'PENDING',
+            newStatus: 'QUEUED',
+            timestamp: new Date().toISOString(),
+            correlationId: item.job.correlationId,
           });
 
           drained++;
@@ -212,10 +275,8 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
 
   log.info({ service: 'scheduler' }, 'Scheduler running');
 
-  const metricsServer = createMetricsServer(
-    config.metricsPort,
-    'scheduler',
-    async () => collectSchedulerMetrics(redis, priorityQueue, delayedQueue),
+  const metricsServer = createMetricsServer(config.metricsPort, 'scheduler', async () =>
+    collectSchedulerMetrics(redis, priorityQueue, delayedQueue),
   );
   log.info({ metricsPort: config.metricsPort }, 'Scheduler metrics server started');
 
@@ -233,9 +294,13 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
 
         for (const row of result.rows) {
           const cron = row as unknown as {
-            id: string; name: string; cron_expression: string;
-            job_type: string; payload: Record<string, unknown>;
-            priority: number; next_run: string | null;
+            id: string;
+            name: string;
+            cron_expression: string;
+            job_type: string;
+            payload: Record<string, unknown>;
+            priority: number;
+            next_run: string | null;
           };
           const interval = CronExpressionParser.parse(cron.cron_expression);
           const nextRun = interval.next().toDate();
@@ -244,41 +309,38 @@ export async function startScheduler(config: SchedulerConfig): Promise<void> {
           if (cron.next_run && new Date(cron.next_run) > now) continue;
 
           const jobId = crypto.randomUUID();
-          const enqueued: EnqueuedJob = {
-            job: {
-              id: jobId,
-              type: cron.job_type as JobType,
-              priority: (cron.priority as number) as JobPriority,
-              status: 'PENDING',
-              payload: cron.payload as Record<string, unknown>,
-              idempotencyKey: null,
-              correlationId: crypto.randomUUID(),
-              retryCount: 0,
-              maxRetries: 3,
-              scheduledAt: null,
-              startedAt: null,
-              completedAt: null,
-              failedAt: null,
-              errorMessage: null,
-              workerId: null,
-              onSuccess: null,
-              onFailure: null,
-              webhookUrl: null,
-              createdAt: now.toISOString(),
-              updatedAt: now.toISOString(),
-            },
-            priority: (cron.priority as number) as JobPriority,
-            enqueuedAt: Date.now(),
-          };
-
-          priorityQueue.enqueue(enqueued);
+          await publishMessage(producer, KAFKA_TOPICS.JOB_SUBMITTED, jobId, {
+            id: jobId,
+            type: cron.job_type,
+            priority: cron.priority,
+            status: 'PENDING',
+            payload: cron.payload,
+            idempotencyKey: null,
+            correlationId: crypto.randomUUID(),
+            retryCount: 0,
+            maxRetries: 3,
+            scheduledAt: null,
+            startedAt: null,
+            completedAt: null,
+            failedAt: null,
+            errorMessage: null,
+            workerId: null,
+            onSuccess: null,
+            onFailure: null,
+            webhookUrl: null,
+            createdAt: now.toISOString(),
+            updatedAt: now.toISOString(),
+          });
 
           await pgPool.query(
             'UPDATE cron_jobs SET last_run = NOW(), next_run = $1, updated_at = NOW() WHERE id = $2',
             [nextRun.toISOString(), cron.id],
           );
 
-          log.info({ cronName: cron.name, jobId, nextRun: nextRun.toISOString() }, 'Cron job triggered');
+          log.info(
+            { cronName: cron.name, jobId, nextRun: nextRun.toISOString() },
+            'Cron job triggered',
+          );
         }
       } catch (err) {
         log.error({ err }, 'Cron poller error');
@@ -305,7 +367,13 @@ async function collectSchedulerMetrics(
   delayedQueue: DelayedQueue,
 ): Promise<string> {
   const types: JobType[] = ['email', 'image', 'data'];
-  const metrics: Array<{ name: string; help: string; type: 'counter' | 'gauge' | 'histogram'; value: number; labels?: Record<string, string> }> = [];
+  const metrics: Array<{
+    name: string;
+    help: string;
+    type: 'counter' | 'gauge' | 'histogram';
+    value: number;
+    labels?: Record<string, string>;
+  }> = [];
 
   for (const type of types) {
     const [enqueued, dequeued, failed, depth] = await Promise.all([
@@ -317,17 +385,56 @@ async function collectSchedulerMetrics(
 
     const labels = { queue: type };
     metrics.push(
-      { name: 'taskqueue_queue_depth', help: 'Queue depth per type', type: 'gauge', value: depth || 0, labels },
-      { name: 'taskqueue_jobs_enqueued_total', help: 'Total enqueued', type: 'counter', value: parseInt(enqueued as string || '0', 10), labels },
-      { name: 'taskqueue_jobs_dequeued_total', help: 'Total dequeued', type: 'counter', value: parseInt(dequeued as string || '0', 10), labels },
-      { name: 'taskqueue_jobs_failed_total', help: 'Total failed', type: 'counter', value: parseInt(failed as string || '0', 10), labels },
+      {
+        name: 'taskqueue_queue_depth',
+        help: 'Queue depth per type',
+        type: 'gauge',
+        value: depth || 0,
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_enqueued_total',
+        help: 'Total enqueued',
+        type: 'counter',
+        value: parseInt((enqueued as string) || '0', 10),
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_dequeued_total',
+        help: 'Total dequeued',
+        type: 'counter',
+        value: parseInt((dequeued as string) || '0', 10),
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_failed_total',
+        help: 'Total failed',
+        type: 'counter',
+        value: parseInt((failed as string) || '0', 10),
+        labels,
+      },
     );
   }
 
   metrics.push(
-    { name: 'taskqueue_priority_queue_depth', help: 'Active priority queue depth', type: 'gauge', value: priorityQueue.size() },
-    { name: 'taskqueue_delayed_queue_depth', help: 'Delayed jobs waiting', type: 'gauge', value: await delayedQueue.size() },
-    { name: 'taskqueue_scheduler_uptime_seconds', help: 'Scheduler uptime', type: 'gauge', value: process.uptime() },
+    {
+      name: 'taskqueue_priority_queue_depth',
+      help: 'Active priority queue depth',
+      type: 'gauge',
+      value: priorityQueue.size(),
+    },
+    {
+      name: 'taskqueue_delayed_queue_depth',
+      help: 'Delayed jobs waiting',
+      type: 'gauge',
+      value: await delayedQueue.size(),
+    },
+    {
+      name: 'taskqueue_scheduler_uptime_seconds',
+      help: 'Scheduler uptime',
+      type: 'gauge',
+      value: process.uptime(),
+    },
   );
 
   return formatMetrics(metrics);
@@ -335,7 +442,9 @@ async function collectSchedulerMetrics(
 
 // Self-invocation entrypoint
 initTracing('scheduler', process.env.OTLP_ENDPOINT);
-process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+process.on('SIGTERM', () => {
+  shutdownTracing().catch(() => {});
+});
 
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:29092').split(',');
 const REDIS_HOST = process.env.REDIS_HOST || 'localhost';

@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { DelayedQueue } from '../src/queue/delayed-queue.js';
-import { getRedisClient } from '../src/redis/index.js';
 import type { EnqueuedJob } from '../src/types/index.js';
 import Redis from 'ioredis';
 
@@ -34,8 +33,9 @@ function makeJob(id: string): EnqueuedJob {
 }
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const describeWithRedis = process.env.RUN_REDIS_TESTS === 'true' ? describe : describe.skip;
 
-describe('DelayedQueue', () => {
+describeWithRedis('DelayedQueue', () => {
   let redis: Redis;
   let queue: DelayedQueue;
 

@@ -69,6 +69,20 @@ export class WorkerQueue {
   }
 
   /**
+   * Remove a queued job by ID.
+   */
+  async remove(jobId: string): Promise<boolean> {
+    const members = await this.redis.lrange(this.key, 0, -1);
+    for (const member of members) {
+      const job = JSON.parse(member) as Job;
+      if (job.id === jobId) {
+        return (await this.redis.lrem(this.key, 1, member)) > 0;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Acquire a distributed lock on a job using SET NX EX.
    * Returns true if the lock was acquired.
    */
@@ -111,22 +125,20 @@ export class WorkerQueue {
   }
 
   /**
-   * Find and reclaim orphaned jobs — jobs with expired locks.
-   * Returns the job IDs that should be re-queued.
+   * Find jobs left in the processing set after their worker lock expired.
    */
   async findExpiredLocks(): Promise<string[]> {
-    const keys = await this.redis.keys(`${this.lockPrefix}*`);
-    const expired: string[] = [];
+    const keys = await this.redis.keys('processing:job:*');
+    const orphaned: string[] = [];
 
     for (const key of keys) {
-      const ttl = await this.redis.ttl(key);
-      if (ttl <= 0) {
-        const jobId = key.replace(this.lockPrefix, '');
-        await this.redis.del(key);
-        expired.push(jobId);
+      const jobId = key.replace('processing:job:', '');
+      const lockExists = await this.redis.exists(`${this.lockPrefix}${jobId}`);
+      if (lockExists === 0) {
+        orphaned.push(jobId);
       }
     }
 
-    return expired;
+    return orphaned;
   }
 }

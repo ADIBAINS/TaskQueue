@@ -12,7 +12,7 @@ import {
   shutdownTracing,
 } from '@taskqueue/shared';
 import type { KafkaConfig, RedisConfig, Job } from '@taskqueue/shared';
-import { initDB, createJob, updateJobStatus, getJob } from './db.js';
+import { initDB, createJob, updateJobStatus, getJob, resetJobForRetry } from './db.js';
 import { RedisStateStore } from './redis-state.js';
 
 const log = createLogger('state-manager');
@@ -42,7 +42,12 @@ export async function startStateManager(config: StateManagerConfig): Promise<voi
   await createConsumer(
     config.kafka,
     'state-manager-group',
-    [KAFKA_TOPICS.JOB_SUBMITTED, KAFKA_TOPICS.JOB_COMPLETED, KAFKA_TOPICS.JOB_FAILED],
+    [
+      KAFKA_TOPICS.JOB_SUBMITTED,
+      KAFKA_TOPICS.JOB_COMPLETED,
+      KAFKA_TOPICS.JOB_FAILED,
+      KAFKA_TOPICS.JOB_STATE_CHANGE,
+    ],
     async ({ topic, message }) => {
       const value = JSON.parse(message.value?.toString() ?? '{}');
       const correlationId = value.correlationId as string;
@@ -55,6 +60,8 @@ export async function startStateManager(config: StateManagerConfig): Promise<voi
           await handleJobCompleted(value, stateStore, producer, logCtx);
         } else if (topic === KAFKA_TOPICS.JOB_FAILED) {
           await handleJobFailed(value, stateStore, producer, logCtx);
+        } else if (topic === KAFKA_TOPICS.JOB_STATE_CHANGE) {
+          await handleStateChange(value, stateStore, logCtx);
         }
       } catch (err) {
         logCtx.error({ err }, 'Failed to process message');
@@ -64,10 +71,8 @@ export async function startStateManager(config: StateManagerConfig): Promise<voi
 
   log.info({ service: 'state-manager' }, 'State Manager running');
 
-  const metricsServer = createMetricsServer(
-    config.metricsPort,
-    'state-manager',
-    async () => collectStateManagerMetrics(redis, stateStore),
+  const metricsServer = createMetricsServer(config.metricsPort, 'state-manager', async () =>
+    collectStateManagerMetrics(redis, stateStore),
   );
   log.info({ metricsPort: config.metricsPort }, 'State Manager metrics server started');
 }
@@ -78,12 +83,24 @@ async function handleJobSubmitted(
   producer: Producer,
   logCtx: Logger,
 ): Promise<void> {
-  const job = await createJob(value as Parameters<typeof createJob>[0]);
+  const existing = await getJob(value.id as string);
+  if (existing && existing.status !== 'FAILED' && existing.status !== 'DEAD') {
+    logCtx.info(
+      { jobId: existing.id, status: existing.status },
+      'Duplicate job submission ignored',
+    );
+    return;
+  }
+
+  const job = existing
+    ? ((await resetJobForRetry(existing.id)) ?? existing)
+    : await createJob(value as Parameters<typeof createJob>[0]);
+
   await stateStore.setJobState(job.id, {
     ...job,
     webhookUrl: (value.webhookUrl as string) || null,
-    onSuccess: value.onSuccess as Job['onSuccess'] || null,
-    onFailure: value.onFailure as Job['onFailure'] || null,
+    onSuccess: (value.onSuccess as Job['onSuccess']) || null,
+    onFailure: (value.onFailure as Job['onFailure']) || null,
   } as Job);
 
   logCtx.info({ jobId: job.id, type: job.type }, 'Job created in DB');
@@ -94,6 +111,41 @@ async function handleJobSubmitted(
     newStatus: job.status,
     timestamp: new Date().toISOString(),
     correlationId: job.correlationId,
+  });
+}
+
+async function handleStateChange(
+  value: Record<string, unknown>,
+  stateStore: RedisStateStore,
+  logCtx: Logger,
+): Promise<void> {
+  const jobId = value.jobId as string;
+  const newStatus = value.newStatus as Job['status'];
+
+  if (!['SCHEDULED', 'QUEUED', 'RUNNING', 'CANCELLED'].includes(newStatus)) {
+    return;
+  }
+
+  const metadata: Record<string, unknown> = {};
+  if (value.workerId) {
+    metadata.workerId = value.workerId;
+  }
+
+  let job = await updateJobStatus(jobId, newStatus, metadata);
+  for (let attempt = 0; !job && attempt < 10; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    job = await updateJobStatus(jobId, newStatus, metadata);
+  }
+
+  if (!job) {
+    logCtx.warn({ jobId, newStatus }, 'Job not found for state transition');
+    return;
+  }
+
+  await stateStore.updateJobFull(jobId, {
+    status: newStatus,
+    workerId: job.workerId,
+    startedAt: job.startedAt,
   });
 }
 
@@ -177,23 +229,63 @@ async function collectStateManagerMetrics(
   stateStore: RedisStateStore,
 ): Promise<string> {
   const types: Array<'email' | 'image' | 'data'> = ['email', 'image', 'data'];
-  const metrics: Array<{ name: string; help: string; type: 'counter' | 'gauge' | 'histogram'; value: number; labels?: Record<string, string> }> = [];
+  const metrics: Array<{
+    name: string;
+    help: string;
+    type: 'counter' | 'gauge' | 'histogram';
+    value: number;
+    labels?: Record<string, string>;
+  }> = [];
 
   for (const type of types) {
     const stats = await stateStore.getQueueStats(type);
     const labels = { queue: type };
     metrics.push(
-      { name: 'taskqueue_queue_depth', help: 'Queue depth', type: 'gauge', value: stats.depth, labels },
-      { name: 'taskqueue_jobs_enqueued_total', help: 'Enqueued total', type: 'counter', value: stats.enqueueRate, labels },
-      { name: 'taskqueue_jobs_dequeued_total', help: 'Dequeued total', type: 'counter', value: stats.dequeueRate, labels },
-      { name: 'taskqueue_jobs_failed_total', help: 'Failed total', type: 'counter', value: stats.failed, labels },
+      {
+        name: 'taskqueue_queue_depth',
+        help: 'Queue depth',
+        type: 'gauge',
+        value: stats.depth,
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_enqueued_total',
+        help: 'Enqueued total',
+        type: 'counter',
+        value: stats.enqueueRate,
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_dequeued_total',
+        help: 'Dequeued total',
+        type: 'counter',
+        value: stats.dequeueRate,
+        labels,
+      },
+      {
+        name: 'taskqueue_jobs_failed_total',
+        help: 'Failed total',
+        type: 'counter',
+        value: stats.failed,
+        labels,
+      },
     );
   }
 
   const workers = await stateStore.getAllWorkers();
   metrics.push(
-    { name: 'taskqueue_workers_active', help: 'Active workers', type: 'gauge', value: workers.length },
-    { name: 'taskqueue_state_manager_uptime_seconds', help: 'Uptime', type: 'gauge', value: process.uptime() },
+    {
+      name: 'taskqueue_workers_active',
+      help: 'Active workers',
+      type: 'gauge',
+      value: workers.length,
+    },
+    {
+      name: 'taskqueue_state_manager_uptime_seconds',
+      help: 'Uptime',
+      type: 'gauge',
+      value: process.uptime(),
+    },
   );
 
   return formatMetrics(metrics);
@@ -201,9 +293,12 @@ async function collectStateManagerMetrics(
 
 // Self-invocation entrypoint
 initTracing('state-manager', process.env.OTLP_ENDPOINT);
-process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+process.on('SIGTERM', () => {
+  shutdownTracing().catch(() => {});
+});
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://taskqueue:taskqueue@localhost:5432/taskqueue';
+const DATABASE_URL =
+  process.env.DATABASE_URL || 'postgresql://taskqueue:taskqueue@localhost:5432/taskqueue';
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:29092').split(',');
 const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10);

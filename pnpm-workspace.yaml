@@ -1,12 +1,13 @@
 packages:
-  - "packages/*"
-  - "services/*"
+  - 'packages/*'
+  - 'services/*'
 
 allowBuilds:
-  esbuild: set this to true or false
-  protobufjs: set this to true or false
-  sharp: set this to true or false
+  esbuild: true
+  protobufjs: true
+  sharp: true
 
 onlyBuiltDependencies:
   - esbuild
+  - protobufjs
   - sharp

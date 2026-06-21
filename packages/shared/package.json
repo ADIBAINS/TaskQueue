@@ -33,8 +33,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-vm-modules --import tsx node_modules/.bin/vitest run",
-    "test:watch": "node --experimental-vm-modules --import tsx node_modules/.bin/vitest",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
     "lint": "prettier --check src/"
   },
   "dependencies": {

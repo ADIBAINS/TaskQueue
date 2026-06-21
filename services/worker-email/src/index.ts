@@ -30,9 +30,8 @@ startWorker(config, async (job: Job) => {
     return { success: false, error: 'Missing required fields: to, subject' };
   }
 
-  const emailBody = template && templateData
-    ? renderTemplate(template, templateData)
-    : (body || '(no body)');
+  const emailBody =
+    template && templateData ? renderTemplate(template, templateData) : body || '(no body)';
 
   const recipients = [to, ...(cc || []), ...(bcc || [])];
   for (const recipient of recipients) {

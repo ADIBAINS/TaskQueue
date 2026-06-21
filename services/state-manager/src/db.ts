@@ -44,10 +44,19 @@ export async function createJob(job: Omit<Job, 'createdAt' | 'updatedAt'>): Prom
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
-        job.id, job.type, job.priority, job.status, JSON.stringify(job.payload),
-        job.idempotencyKey, job.correlationId, job.retryCount, job.maxRetries,
-        job.scheduledAt, job.onSuccess ? JSON.stringify(job.onSuccess) : null,
-        job.onFailure ? JSON.stringify(job.onFailure) : null, job.webhookUrl,
+        job.id,
+        job.type,
+        job.priority,
+        job.status,
+        JSON.stringify(job.payload),
+        job.idempotencyKey,
+        job.correlationId,
+        job.retryCount,
+        job.maxRetries,
+        job.scheduledAt,
+        job.onSuccess ? JSON.stringify(job.onSuccess) : null,
+        job.onFailure ? JSON.stringify(job.onFailure) : null,
+        job.webhookUrl,
       ],
     );
     return rowToJob(result.rows[0]! as unknown as Record<string, unknown>);
@@ -68,6 +77,16 @@ export async function updateJobStatus(
   try {
     await client.query('BEGIN');
 
+    const existing = await client.query<Record<string, unknown>>(
+      'SELECT * FROM jobs WHERE id = $1 FOR UPDATE',
+      [jobId],
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const previousStatus = existing.rows[0]!.status as JobStatus;
     const updates: string[] = ['status = $2', 'updated_at = NOW()'];
     const values: unknown[] = [jobId, status];
     let paramIndex = 3;
@@ -80,7 +99,7 @@ export async function updateJobStatus(
       }
     } else if (status === 'SUCCESS') {
       updates.push('completed_at = NOW()');
-    } else if (status === 'FAILED') {
+    } else if (status === 'FAILED' || status === 'DEAD') {
       updates.push('failed_at = NOW()');
       updates.push(`retry_count = retry_count + 1`);
       if (metadata.errorMessage) {
@@ -103,8 +122,57 @@ export async function updateJobStatus(
 
     await client.query(
       `INSERT INTO audit_log (job_id, previous_status, new_status, metadata, correlation_id)
-       VALUES ($1, (SELECT status FROM jobs WHERE id = $1), $2, $3, $4)`,
-      [jobId, status, JSON.stringify(metadata), job.correlationId],
+       VALUES ($1, $2, $3, $4, $5)`,
+      [jobId, previousStatus, status, JSON.stringify(metadata), job.correlationId],
+    );
+
+    await client.query('COMMIT');
+    return job;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Reset an existing failed job for a user-requested retry.
+ */
+export async function resetJobForRetry(jobId: string): Promise<Job | null> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existing = await client.query<Record<string, unknown>>(
+      'SELECT * FROM jobs WHERE id = $1 FOR UPDATE',
+      [jobId],
+    );
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+
+    const previous = rowToJob(existing.rows[0]!);
+    if (previous.status !== 'FAILED' && previous.status !== 'DEAD') {
+      await client.query('COMMIT');
+      return previous;
+    }
+
+    const result = await client.query<Record<string, unknown>>(
+      `UPDATE jobs
+       SET status = 'PENDING', retry_count = 0, started_at = NULL,
+           completed_at = NULL, failed_at = NULL, error_message = NULL,
+           worker_id = NULL, updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [jobId],
+    );
+    const job = rowToJob(result.rows[0]!);
+
+    await client.query(
+      `INSERT INTO audit_log (job_id, previous_status, new_status, metadata, correlation_id)
+       VALUES ($1, $2, 'PENDING', $3, $4)`,
+      [jobId, previous.status, JSON.stringify({ reason: 'manual_retry' }), job.correlationId],
     );
 
     await client.query('COMMIT');
@@ -121,10 +189,9 @@ export async function updateJobStatus(
  * Get a job by ID.
  */
 export async function getJob(jobId: string): Promise<Job | null> {
-  const result = await pool.query<Record<string, unknown>>(
-    'SELECT * FROM jobs WHERE id = $1',
-    [jobId],
-  );
+  const result = await pool.query<Record<string, unknown>>('SELECT * FROM jobs WHERE id = $1', [
+    jobId,
+  ]);
   if (result.rows.length === 0) return null;
   return rowToJob(result.rows[0]!);
 }

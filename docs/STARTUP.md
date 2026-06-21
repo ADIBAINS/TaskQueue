@@ -1,517 +1,292 @@
-# TaskQueue — Startup & Verification Guide
+# Local development and verification
 
-This guide walks through starting every component from scratch and verifying each one works. Follow it in order — each step depends on the previous.
-
----
+This guide starts TaskQueue locally with infrastructure in Docker and application services
+running as Node.js processes.
 
 ## Prerequisites
 
-You need these installed on your machine:
+| Tool           | Supported baseline |
+| -------------- | ------------------ |
+| Node.js        | 20 or newer        |
+| pnpm           | 9 or newer         |
+| Docker         | 24 or newer        |
+| Docker Compose | 2 or newer         |
 
-| Tool | Version | Check |
-|------|---------|-------|
-| Node.js | ≥20.0.0 | `node --version` |
-| pnpm | ≥9.0.0 | `pnpm --version` |
-| Docker | ≥24.0.0 | `docker --version` |
-| Docker Compose | ≥2.0.0 | `docker compose version` |
+Optional tools: `jq`, `redis-cli`, `pg_isready`, and `wscat`.
 
-**Install pnpm if missing:**
-```bash
-npm install -g pnpm
-```
-
----
-
-## Step 1 — Clone & Install Dependencies
+## 1. Install and configure
 
 ```bash
 cd ~/genesis/dev/Projects/taskqueue
 pnpm install
-```
-
-**Verify:** You should see all 10 workspace packages resolve without errors.
-
-```bash
-pnpm ls -r --depth 0
-```
-
-Expected output lists: `@taskqueue/shared`, `@taskqueue/api-gateway`, `@taskqueue/scheduler`, `@taskqueue/state-manager`, `@taskqueue/notifier`, `@taskqueue/metrics-exporter`, `@taskqueue/worker-email`, `@taskqueue/worker-image`, `@taskqueue/worker-data`.
-
----
-
-## Step 2 — Build the Shared Package
-
-All services depend on `@taskqueue/shared`. Build it first:
-
-```bash
-pnpm --filter @taskqueue/shared build
-```
-
-**Verify:** `packages/shared/dist/` directory exists with compiled `.js` and `.d.ts` files.
-
----
-
-## Step 3 — TypeScript Type Check (Optional but Recommended)
-
-```bash
-pnpm -r typecheck
-```
-
-Every service should report `OK`. If any fail, stop and fix before continuing.
-
----
-
-## Step 4 — Run Unit Tests
-
-```bash
-pnpm --filter @taskqueue/shared test
-```
-
-**Expected:** 7 tests pass (PriorityQueue tests). The DelayedQueue tests require Redis and will be skipped or fail if Redis isn't running — that's fine at this stage.
-
----
-
-## Step 5 — Create Your .env File
-
-```bash
 cp .env.example .env
 ```
 
-**What YOU need to set:**
+Generate a secret and place it in `.env`:
 
-| Variable | Default | What to change |
-|----------|---------|----------------|
-| `JWT_SECRET` | `change-me-in-production` | **MUST change** — generate a random string: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `DATABASE_URL` | Already correct for Docker | No change needed for local dev |
-| Everything else | Already correct | No changes needed for local dev |
-
-**Minimal .env file (copy this exactly if you want):**
 ```bash
+openssl rand -hex 32
+```
+
+At minimum, verify these values:
+
+```dotenv
 KAFKA_BROKERS=localhost:29092
 REDIS_HOST=localhost
 REDIS_PORT=6379
 DATABASE_URL=postgresql://taskqueue:taskqueue@localhost:5432/taskqueue
-PORT=3000
-JWT_SECRET=<your-generated-secret-here>
+JWT_SECRET=<generated-secret>
 LOG_LEVEL=info
 NODE_ENV=development
+OTLP_ENDPOINT=http://localhost:4318/v1/traces
 ```
 
----
+Shell commands do not automatically load `.env`. Export it before starting services:
 
-## Step 6 — Start Infrastructure (Docker)
+```bash
+set -a
+source .env
+set +a
+```
 
-This starts Kafka, Zookeeper, PostgreSQL, Redis, Prometheus, Grafana, and Jaeger:
+## 2. Validate the workspace
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm lint
+pnpm build
+```
+
+The normal test command skips Redis-backed integration tests. Run them after Redis starts:
+
+```bash
+RUN_REDIS_TESTS=true REDIS_URL=redis://localhost:6379 \
+  pnpm --filter @taskqueue/shared test
+```
+
+## 3. Start infrastructure
 
 ```bash
 docker compose up -d
-```
-
-**Wait for all containers to be healthy (about 30-60 seconds):**
-
-```bash
 docker compose ps
 ```
 
-**Verify each container runs:**
+Compose starts:
+
+- ZooKeeper and a single Kafka broker
+- Kafka topic initialization
+- PostgreSQL
+- Redis
+- Prometheus
+- Grafana
+- Jaeger
+
+It does not start TaskQueue application services.
+
+Verify infrastructure:
 
 ```bash
-docker compose logs kafka-init | grep "All topics created"
-docker compose logs postgres | grep "database system is ready"
-docker compose logs redis | grep "Ready to accept connections"
+docker compose logs kafka-init
+docker compose exec redis redis-cli ping
+docker compose exec postgres pg_isready -U taskqueue
 ```
 
-If `kafka-init` exited with code 0 and you see "All topics created.", Kafka is ready.
+The one-shot `kafka-init` container should exit successfully after creating six topics.
 
-**Verify infrastructure ports:**
-
-```bash
-# PostgreSQL
-pg_isready -h localhost -p 5432 -U taskqueue
-
-# Redis
-redis-cli -h localhost -p 6379 PING
-
-# Kafka broker
-docker exec tq-kafka kafka-broker-api-versions --bootstrap-server localhost:9092 | head -5
-```
-
----
-
-## Step 7 — Run Database Migrations
+## 4. Apply database migrations
 
 ```bash
 pnpm --filter @taskqueue/state-manager migrate
 ```
 
-**Verify:** No errors in output. Check the tables were created:
+Verify the schema:
 
 ```bash
-docker exec tq-postgres psql -U taskqueue -d taskqueue -c "\dt"
+docker compose exec postgres \
+  psql -U taskqueue -d taskqueue -c '\dt'
 ```
 
-Expected tables: `jobs`, `workers`, `audit_log`, `dlq`, `cron_jobs`, `migrations`.
+Expected tables:
 
----
+- `jobs`
+- `workers`
+- `audit_log`
+- `dlq`
+- `cron_jobs`
+- `migrations`
 
-## Step 8 — Generate a JWT Token
+## 5. Start application services
 
-You need this to submit jobs. Generate one:
+Export `.env` in each terminal, or run the following from shells where it is already
+exported.
+
+Start the state manager first, then the scheduler, API, notifier, metrics exporter, and
+workers:
 
 ```bash
-node -e "
-const jwt = require('jsonwebtoken');
-const secret = process.env.JWT_SECRET || 'change-me-in-production';
-const token = jwt.sign({ client: 'cli' }, secret, { expiresIn: '24h' });
-console.log(token);
-"
+pnpm dev:state-manager
+pnpm dev:scheduler
+pnpm dev:api
+pnpm dev:notifier
+pnpm dev:metrics
+pnpm dev:worker-email
+pnpm dev:worker-image
+pnpm dev:worker-data
 ```
 
-**Save this token** — you'll use it in every API call.
+Default ports:
 
----
+| Process               | Port |
+| --------------------- | ---: |
+| API Gateway           | 3000 |
+| Scheduler metrics     | 3200 |
+| State Manager metrics | 3300 |
+| Notifier WebSocket    | 3400 |
+| Metrics Exporter      | 3500 |
+| Email Worker metrics  | 3600 |
+| Image Worker metrics  | 3601 |
+| Data Worker metrics   | 3602 |
 
-## Step 9 — Start Services (8 Terminal Windows)
-
-Open **8 separate terminals**. In each, run one of these commands. Order matters — start state-manager first, then the rest.
-
-### Terminal 1 — State Manager (start first)
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/state-manager
-source ../../.env 2>/dev/null
-METRICS_PORT=3300 npx tsx src/index.ts
-```
-
-### Terminal 2 — Scheduler
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/scheduler
-source ../../.env 2>/dev/null
-npx tsx src/index.ts
-```
-
-### Terminal 3 — API Gateway
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/api-gateway
-source ../../.env 2>/dev/null
-npx tsx src/index.ts
-```
-
-### Terminal 4 — Notifier
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/notifier
-source ../../.env 2>/dev/null
-PORT=3400 npx tsx src/index.ts
-```
-
-### Terminal 5 — Metrics Exporter
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/metrics-exporter
-source ../../.env 2>/dev/null
-PORT=3500 npx tsx src/index.ts
-```
-
-### Terminal 6 — Email Worker
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/worker-email
-source ../../.env 2>/dev/null
-METRICS_PORT=3600 npx tsx src/index.ts
-```
-
-### Terminal 7 — Image Worker
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/worker-image
-source ../../.env 2>/dev/null
-METRICS_PORT=3601 npx tsx src/index.ts
-```
-
-### Terminal 8 — Data Worker
-```bash
-cd ~/genesis/dev/Projects/taskqueue/services/worker-data
-source ../../.env 2>/dev/null
-METRICS_PORT=3602 npx tsx src/index.ts
-```
-
-**Verify each service started:** Look for log lines like:
-- `"API Gateway listening"` (port 3000)
-- `"Scheduler running"` + `"Scheduler metrics server started"` (port 3200)
-- `"State Manager running"` + `"State Manager metrics server started"` (port 3300)
-- `"WebSocket server listening"` (port 3400)
-- `"Metrics exporter listening"` (port 3500)
-- `"Worker started"` (email 3600, image 3601, data 3602)
-
----
-
-## Step 10 — Verify Each Component
-
-### 10a — Submit a Test Job
+## 6. Configure the CLI
 
 ```bash
-TOKEN="<paste-your-jwt-token-here>"
-
-curl -s -X POST http://localhost:3000/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "email",
-    "priority": 1,
-    "payload": {
-      "to": "hello@example.com",
-      "subject": "Test from TaskQueue",
-      "body": "This is a test email job."
-    }
-  }' | jq .
+pnpm taskqueue profile use local
+pnpm taskqueue config set api-url http://localhost:3000
+pnpm taskqueue auth login --secret "$JWT_SECRET"
+pnpm taskqueue auth status
+pnpm taskqueue health
 ```
 
-**Expected:** Returns a JSON object with `job.id`, `job.type: "email"`, `job.status: "PENDING"`.
+CLI profiles are stored in `~/.config/taskqueue/config.json` with file mode `0600`.
 
-Save the job ID from the response:
-```bash
-JOB_ID="<from-response>"
-```
+## 7. Verify job processing
 
-### 10b — Check Job Status
+Submit an email job:
 
 ```bash
-curl -s http://localhost:3000/jobs/$JOB_ID | jq .
+pnpm taskqueue job submit email --priority 1 --payload '{
+  "to":"hello@example.com",
+  "subject":"TaskQueue test",
+  "body":"Local verification"
+}'
 ```
 
-The job should transition: `PENDING` → `QUEUED` → `RUNNING` → `SUCCESS` within a few seconds.
-
-### 10c — Submit a Delayed Job
+Use the returned ID:
 
 ```bash
-curl -s -X POST http://localhost:3000/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "data",
-    "priority": 2,
-    "payload": {"operation": "aggregate", "dataset": "sales_q4"},
-    "scheduledAt": "'$(date -u -d '+30 seconds' +%Y-%m-%dT%H:%M:%SZ)'"
-  }' | jq .
+pnpm taskqueue job get <job-id>
+pnpm taskqueue job watch <job-id>
+pnpm taskqueue job list --type email --limit 10
 ```
 
-The job should wait ~30 seconds before moving to RUNNING.
+The typical lifecycle is `PENDING → QUEUED → RUNNING → SUCCESS`. The demonstration workers
+intentionally inject occasional random failures, so retries may occur.
 
-### 10d — Submit with Idempotency Key
+Submit a delayed job using an ISO-8601 timestamp:
 
 ```bash
-curl -s -X POST http://localhost:3000/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "image",
-    "priority": 3,
-    "payload": {"url": "photo.jpg", "width": 800, "height": 600},
-    "idempotencyKey": "unique-key-123"
-  }' | jq .
-
-# Submit the same again
-curl -s -X POST http://localhost:3000/jobs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "image",
-    "priority": 3,
-    "payload": {"url": "photo.jpg", "width": 800, "height": 600},
-    "idempotencyKey": "unique-key-123"
-  }' | jq .
+pnpm taskqueue job submit data \
+  --schedule '<future-iso-8601-timestamp>' \
+  --payload '{"operation":"cleanup"}'
 ```
 
-The second call should return `"deduplicated": true` with the same job.
-
-### 10e — Check Queue Stats
+Create a cron job:
 
 ```bash
-curl -s http://localhost:3000/queues/stats | jq .
+pnpm taskqueue cron create hourly-cleanup '0 * * * *' data \
+  --payload '{"operation":"cleanup"}' \
+  --priority 5
 ```
 
-### 10f — Create a Cron Job
+Other checks:
 
 ```bash
-curl -s -X POST http://localhost:3000/cron \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "hourly-cleanup",
-    "cronExpression": "0 * * * *",
-    "jobType": "data",
-    "payload": {"operation": "cleanup"},
-    "priority": 5
-  }' | jq .
+pnpm taskqueue queue stats
+pnpm taskqueue cron list
+pnpm taskqueue dlq list
 ```
 
-### 10g — List Cron Jobs & DLQ
+## 8. Verify metrics and tracing
 
 ```bash
-curl -s http://localhost:3000/cron -H "Authorization: Bearer $TOKEN" | jq .
-curl -s http://localhost:3000/dlq -H "Authorization: Bearer $TOKEN" | jq .
+curl http://localhost:3200/metrics
+curl http://localhost:3300/metrics
+curl http://localhost:3500/metrics
+curl http://localhost:3600/metrics
+curl http://localhost:3601/metrics
+curl http://localhost:3602/metrics
 ```
 
-### 10h — Verify Metrics Endpoints
+The API Gateway and Notifier do not currently expose Prometheus endpoints.
 
-```bash
-curl -s http://localhost:3200/metrics | grep taskqueue
-curl -s http://localhost:3300/metrics | grep taskqueue
-curl -s http://localhost:3500/metrics | grep taskqueue
-curl -s http://localhost:3600/metrics | grep taskqueue
-```
+Local observability:
 
-Each should return Prometheus-formatted metrics with `taskqueue_*` lines.
+| Tool       | URL                    | Credentials       |
+| ---------- | ---------------------- | ----------------- |
+| Prometheus | http://localhost:9090  | none              |
+| Grafana    | http://localhost:3001  | `admin` / `admin` |
+| Jaeger     | http://localhost:16686 | none              |
 
-### 10i — Verify WebSocket Notifications
-
-Use a WebSocket client:
-```bash
-# Install wscat if needed: npm install -g wscat
-wscat -c ws://localhost:3400 -H "x-client-id: test-client"
-```
-
-Once connected, send a subscribe message:
-```json
-{"type": "subscribe", "jobId": "<paste-a-job-id>"}
-```
-
-Then submit a job with that ID — you'll receive real-time status updates.
-
----
-
-## Step 11 — Verify Observability Stack
-
-| Component | URL | Credentials |
-|-----------|-----|-------------|
-| **Prometheus** | http://localhost:9090 | None |
-| **Grafana** | http://localhost:3000 | admin / admin |
-| **Jaeger** | http://localhost:16686 | None |
-
-**Prometheus check:** Go to http://localhost:9090 → Status → Targets. You should see targets for api-gateway, scheduler, state-manager, notifier, metrics-exporter, and all 3 workers as UP.
-
-**Grafana check:** Go to http://localhost:3000 → Dashboards → TaskQueue folder. Three dashboards should appear: Queue Health, Worker Health, System Overview.
-
-**Jaeger check:** Go to http://localhost:16686 → Search. If you set `OTLP_ENDPOINT=http://localhost:4318/v1/traces`, traces from all 8 services should appear after processing jobs.
-
----
-
-## Step 12 — Enable Distributed Tracing (Optional)
-
-Add this to your `.env` and restart all services:
-```bash
-OTLP_ENDPOINT=http://localhost:4318/v1/traces
-```
-
-Then submit a job and look for traces in Jaeger at http://localhost:16686. You'll see spans across API Gateway → Scheduler → Worker → State Manager → Notifier.
-
----
-
-## Things YOU Need to Implement
-
-These items are intentionally left for you as the developer to customize:
-
-### 1. JWT Secret
-Generate and set `JWT_SECRET` in your `.env`. The default `change-me-in-production` is intentionally insecure.
-
-### 2. Actual Email Sending
-`services/worker-email/src/index.ts` currently simulates email delivery. To send real emails, replace the `execute` function with nodemailer/SES/SendGrid integration.
-
-### 3. Actual Image Processing
-`services/worker-image/src/index.ts` simulates image processing. To process real images, import `sharp` (already in `package.json`) and implement actual resize/format/watermark operations.
-
-### 4. Actual Data Processing
-`services/worker-data/src/index.ts` simulates data operations. To process real data, connect to your database and implement actual ETL logic.
-
-### 5. Production PostgreSQL
-The Docker PostgreSQL container has no persistent volume in production. For real deployments, use a managed PostgreSQL service (RDS, Cloud SQL) and set `DATABASE_URL` accordingly.
-
-### 6. Production Kafka
-For production, use a managed Kafka service (Confluent Cloud, MSK) instead of the single-broker Docker setup. Update `KAFKA_BROKERS` accordingly.
-
-### 7. TLS/SSL
-All connections are plaintext in local dev. For production, configure TLS for Kafka, Redis, and PostgreSQL connections.
-
-### 8. Kubernetes Cluster
-The `k8s/` and `helm/` directories contain production manifests. You need:
-- A running Kubernetes cluster (EKS, GKE, AKS, or local k3s)
-- `kubectl` configured
-- Helm 3 installed
-- KEDA installed: `helm install keda kedacore/keda --namespace keda --create-namespace`
-- Prometheus Operator (for ServiceMonitor CRD): `helm install prometheus-operator prometheus-community/kube-prometheus-stack`
-
-### 9. Container Registry
-The GitHub Actions CI/CD pushes to `ghcr.io`. You need:
-- A GitHub repository with the code pushed
-- GitHub Container Registry enabled
-- ArgoCD installed on your cluster
-
-### 10. Admin CLI (from spec)
-A TypeScript CLI using Commander.js for:
-- `taskqueue queue list` — show all queues
-- `taskqueue queue drain <type>` — drain a queue
-- `taskqueue worker pause <type>` — pause a worker pool
-- `taskqueue dlq requeue <id>` — move job from DLQ back to queue
-
----
+Prometheus runs inside Docker and scrapes application processes through
+`host.docker.internal`. Compose supplies a host-gateway mapping for Linux Docker engines.
 
 ## Troubleshooting
 
-### Kafka connection refused
+### A service cannot connect to Kafka
+
+Use `localhost:29092` from host processes. `kafka:9092` is only resolvable from the Compose
+network or Kubernetes.
+
 ```bash
-docker compose restart kafka kafka-init
-# Wait 10 seconds, then check:
-docker compose logs kafka-init | tail -5
+docker compose ps kafka
+docker compose logs kafka kafka-init
 ```
 
-### PostgreSQL connection refused
+### A service cannot connect to PostgreSQL or Redis
+
 ```bash
-docker compose restart postgres
-# Wait for "database system is ready" in logs
-docker compose logs postgres | grep "ready"
+docker compose ps postgres redis
+docker compose logs postgres redis
 ```
 
-### Redis connection refused
+Confirm `.env` is exported into the service shell.
+
+### Job status is initially not found
+
+Kafka processing is asynchronous. Retry after a short delay and inspect the state-manager
+logs if the job never appears.
+
+### CLI authentication fails
+
+The secret used by `taskqueue auth login` must be identical to the API Gateway
+`JWT_SECRET`. Alternatively, save an externally issued token:
+
 ```bash
-docker compose restart redis
+pnpm taskqueue auth token '<jwt>'
 ```
 
-### "Job not found" when checking status
-The state-manager might not have processed the job yet. Wait a few seconds and retry. Check state-manager terminal for errors.
+### Port conflict
 
-### pnpm build failures in shared package
 ```bash
-rm -rf packages/shared/dist
-pnpm --filter @taskqueue/shared build
-```
-
-### Port conflicts
-If ports 3000, 3200, 3300, 3400, 3500, or 3600-3602 are in use:
-```bash
-# Find what's using a port
 lsof -i :3000
-# Kill it
-kill -9 <PID>
 ```
-Or change the ports in your `.env` and adjust `config/prometheus/prometheus.yml`.
 
----
+Change the relevant `PORT` or `METRICS_PORT`, then update Prometheus configuration if a
+metrics port changed.
 
-## Complete Verification Checklist
+## Shutdown and reset
 
-Run through this checklist to confirm everything works:
+Stop application processes with `Ctrl+C`, then:
 
-- [ ] `docker compose ps` shows all 8 containers running
-- [ ] `pnpm -r typecheck` passes for all 9 packages
-- [ ] `pnpm --filter @taskqueue/shared test` passes 7 tests
-- [ ] Database migrations applied (tables exist)
-- [ ] JWT token generated and saved
-- [ ] API Gateway responds to `GET /health`
-- [ ] Job submission returns a job object
-- [ ] Job transitions through PENDING → QUEUED → RUNNING → SUCCESS
-- [ ] Delayed job waits the specified time before processing
-- [ ] Idempotency key prevents duplicate jobs
-- [ ] Queue stats endpoint returns data
-- [ ] Cron job creation works
-- [ ] DLQ listing works
-- [ ] All metrics endpoints return Prometheus data
-- [ ] WebSocket notifications work
-- [ ] Prometheus targets are UP
-- [ ] Grafana dashboards show data
-- [ ] (If OTLP enabled) Jaeger shows traces
+```bash
+docker compose down
+```
+
+Remove local PostgreSQL, Redis, Prometheus, and Grafana volumes:
+
+```bash
+docker compose down -v
+```
+
+This permanently deletes local development data.

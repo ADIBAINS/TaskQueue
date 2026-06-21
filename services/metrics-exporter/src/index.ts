@@ -1,10 +1,5 @@
 import express from 'express';
-import {
-  createLogger,
-  getRedisClient,
-  initTracing,
-  shutdownTracing,
-} from '@taskqueue/shared';
+import { createLogger, getRedisClient, initTracing, shutdownTracing } from '@taskqueue/shared';
 import type { RedisConfig } from '@taskqueue/shared';
 
 const log = createLogger('metrics-exporter');
@@ -36,7 +31,9 @@ function formatPrometheus(samples: MetricSample[]): string {
     output += `# TYPE ${name} ${group[0]!.type}\n`;
     for (const s of group) {
       const labels = s.labels
-        ? `{${Object.entries(s.labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`
+        ? `{${Object.entries(s.labels)
+            .map(([k, v]) => `${k}="${v}"`)
+            .join(',')}}`
         : '';
       output += `${name}${labels} ${s.value}\n`;
     }
@@ -76,7 +73,9 @@ export async function startMetricsExporter(config: MetricsExporterConfig): Promi
 
 // Self-invocation entrypoint
 initTracing('metrics-exporter', process.env.OTLP_ENDPOINT);
-process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+process.on('SIGTERM', () => {
+  shutdownTracing().catch(() => {});
+});
 
 const PORT = parseInt(process.env.PORT || '3500', 10);
 const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
@@ -105,7 +104,7 @@ async function collectMetrics(redis: ReturnType<typeof getRedisClient>): Promise
       name: 'taskqueue_jobs_enqueued_total',
       help: 'Total number of jobs enqueued to worker queues',
       type: 'counter',
-      value: parseInt(enqueued as string || '0', 10),
+      value: parseInt((enqueued as string) || '0', 10),
       labels,
     });
 
@@ -113,7 +112,7 @@ async function collectMetrics(redis: ReturnType<typeof getRedisClient>): Promise
       name: 'taskqueue_jobs_dequeued_total',
       help: 'Total number of jobs dequeued from worker queues',
       type: 'counter',
-      value: parseInt(dequeued as string || '0', 10),
+      value: parseInt((dequeued as string) || '0', 10),
       labels,
     });
 
@@ -121,7 +120,7 @@ async function collectMetrics(redis: ReturnType<typeof getRedisClient>): Promise
       name: 'taskqueue_jobs_failed_total',
       help: 'Total number of failed jobs',
       type: 'counter',
-      value: parseInt(failed as string || '0', 10),
+      value: parseInt((failed as string) || '0', 10),
       labels,
     });
 

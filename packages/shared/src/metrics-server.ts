@@ -40,13 +40,15 @@ export function createMetricsServer(
 }
 
 /** Simple Prometheus text format formatter. */
-export function formatMetrics(samples: Array<{
-  name: string;
-  help: string;
-  type: 'counter' | 'gauge' | 'histogram';
-  value: number;
-  labels?: Record<string, string>;
-}>): string {
+export function formatMetrics(
+  samples: Array<{
+    name: string;
+    help: string;
+    type: 'counter' | 'gauge' | 'histogram';
+    value: number;
+    labels?: Record<string, string>;
+  }>,
+): string {
   const grouped = new Map<string, typeof samples>();
   for (const s of samples) {
     const existing = grouped.get(s.name) || [];
@@ -60,7 +62,9 @@ export function formatMetrics(samples: Array<{
     output += `# TYPE ${name} ${group[0]!.type}\n`;
     for (const s of group) {
       const labels = s.labels
-        ? `{${Object.entries(s.labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`
+        ? `{${Object.entries(s.labels)
+            .map(([k, v]) => `${k}="${v}"`)
+            .join(',')}}`
         : '';
       output += `${name}${labels} ${s.value}\n`;
     }

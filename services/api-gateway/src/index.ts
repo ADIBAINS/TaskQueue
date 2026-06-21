@@ -14,7 +14,15 @@ import {
   initTracing,
   shutdownTracing,
 } from '@taskqueue/shared';
-import type { KafkaConfig, RedisConfig, PendingJob, JobType, JobPriority, QueueStats, DLQEntry } from '@taskqueue/shared';
+import type {
+  KafkaConfig,
+  RedisConfig,
+  PendingJob,
+  JobType,
+  JobPriority,
+  QueueStats,
+  DLQEntry,
+} from '@taskqueue/shared';
 
 const log = createLogger('api-gateway');
 
@@ -65,15 +73,35 @@ export async function startAPIGateway(config: APIGatewayConfig): Promise<void> {
    */
   app.post('/jobs', authenticate(config.jwtSecret), async (req, res) => {
     try {
-      const { type, priority = 3, payload = {}, idempotencyKey, maxRetries = 3, scheduledAt, onSuccess, onFailure, webhookUrl } = req.body;
+      const {
+        type,
+        priority = 3,
+        payload = {},
+        idempotencyKey,
+        maxRetries = 3,
+        scheduledAt,
+        onSuccess,
+        onFailure,
+        webhookUrl,
+      } = req.body;
 
       if (!type || !['email', 'image', 'data'].includes(type)) {
         res.status(400).json({ error: 'Invalid job type. Must be: email, image, or data' });
         return;
       }
 
-      if (priority < 1 || priority > 5) {
-        res.status(400).json({ error: 'Priority must be between 1 and 5' });
+      if (!Number.isInteger(priority) || priority < 1 || priority > 5) {
+        res.status(400).json({ error: 'Priority must be an integer between 1 and 5' });
+        return;
+      }
+
+      if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 100) {
+        res.status(400).json({ error: 'maxRetries must be an integer between 0 and 100' });
+        return;
+      }
+
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+        res.status(400).json({ error: 'payload must be a JSON object' });
         return;
       }
 
@@ -126,6 +154,69 @@ export async function startAPIGateway(config: APIGatewayConfig): Promise<void> {
   });
 
   /**
+   * GET /jobs - List recent jobs with optional type and status filters.
+   */
+  app.get('/jobs', authenticate(config.jwtSecret), async (req, res) => {
+    if (!pgPool) {
+      res.status(501).json({ error: 'Job listing requires a database connection' });
+      return;
+    }
+
+    const type = req.query.type as string | undefined;
+    const status = req.query.status as string | undefined;
+    const requestedLimit = Number(req.query.limit || 50);
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.min(200, Math.max(1, requestedLimit))
+      : 50;
+
+    if (type && !['email', 'image', 'data'].includes(type)) {
+      res.status(400).json({ error: 'Invalid job type' });
+      return;
+    }
+
+    const validStatuses = [
+      'PENDING',
+      'QUEUED',
+      'SCHEDULED',
+      'RUNNING',
+      'SUCCESS',
+      'FAILED',
+      'DEAD',
+      'CANCELLED',
+    ];
+    if (status && !validStatuses.includes(status.toUpperCase())) {
+      res.status(400).json({ error: 'Invalid job status' });
+      return;
+    }
+
+    try {
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+      if (type) {
+        params.push(type);
+        conditions.push(`type = $${params.length}`);
+      }
+      if (status) {
+        params.push(status.toUpperCase());
+        conditions.push(`status = $${params.length}`);
+      }
+      params.push(limit);
+
+      const result = await pgPool.query<Record<string, unknown>>(
+        `SELECT * FROM jobs
+         ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
+         ORDER BY created_at DESC
+         LIMIT $${params.length}`,
+        params,
+      );
+      res.json({ jobs: result.rows, count: result.rows.length });
+    } catch (err) {
+      log.error({ err }, 'Failed to list jobs');
+      res.status(500).json({ error: 'Failed to list jobs' });
+    }
+  });
+
+  /**
    * GET /jobs/:id - Get job status
    */
   app.get('/jobs/:id', async (req, res) => {
@@ -142,11 +233,29 @@ export async function startAPIGateway(config: APIGatewayConfig): Promise<void> {
    */
   app.post('/jobs/:id/cancel', authenticate(config.jwtSecret), async (req, res) => {
     const jobId = req.params['id'] as string;
+    const cached = await redis.get(`job:state:${jobId}`);
+    if (!cached) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+
+    const job = JSON.parse(cached);
+    if (!['PENDING', 'SCHEDULED', 'QUEUED'].includes(job.status)) {
+      res.status(409).json({ error: `Job in ${job.status} state cannot be cancelled` });
+      return;
+    }
+
+    const previousStatus = job.status;
+    job.status = 'CANCELLED';
+    job.updatedAt = new Date().toISOString();
+    await redis.set(`job:state:${jobId}`, JSON.stringify(job), 'EX', 3600);
+
     await publishMessage(producer, KAFKA_TOPICS.JOB_STATE_CHANGE, jobId, {
       jobId,
-      previousStatus: null,
+      previousStatus,
       newStatus: 'CANCELLED',
       timestamp: new Date().toISOString(),
+      correlationId: job.correlationId,
     });
     res.json({ jobId, status: 'CANCELLED' });
   });
@@ -195,8 +304,8 @@ export async function startAPIGateway(config: APIGatewayConfig): Promise<void> {
         queueName: type,
         depth: depth || 0,
         processing: 0,
-        failed: parseInt(failed as string || '0', 10),
-        enqueueRate: parseInt(enqueued as string || '0', 10),
+        failed: parseInt((failed as string) || '0', 10),
+        enqueueRate: parseInt((enqueued as string) || '0', 10),
         dequeueRate: 0,
       });
     }
@@ -258,7 +367,7 @@ export async function startAPIGateway(config: APIGatewayConfig): Promise<void> {
 
       const job: PendingJob = {
         id: uuidv4(),
-        type: (dlqEntry.job_type as string) as JobType,
+        type: dlqEntry.job_type as string as JobType,
         priority: 3,
         payload: dlqEntry.payload as Record<string, unknown>,
         idempotencyKey: null,
@@ -403,7 +512,9 @@ function authenticate(secret: string): express.RequestHandler {
 
 // Self-invocation entrypoint
 initTracing('api-gateway', process.env.OTLP_ENDPOINT);
-process.on('SIGTERM', () => { shutdownTracing().catch(() => {}); });
+process.on('SIGTERM', () => {
+  shutdownTracing().catch(() => {});
+});
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || 'localhost:29092').split(',');

@@ -64,6 +64,30 @@ export class PriorityQueue {
   }
 
   /**
+   * Remove a job by ID.
+   * Returns true when a queued job was removed.
+   */
+  remove(jobId: string): boolean {
+    const index = this.heap.findIndex((item) => item.job.id === jobId);
+    if (index === -1) {
+      return false;
+    }
+
+    const last = this.heap.pop()!;
+    if (index < this.heap.length) {
+      this.heap[index] = last;
+      const parent = Math.floor((index - 1) / 2);
+      if (index > 0 && this.heap[index]!.priority < this.heap[parent]!.priority) {
+        this.siftUp(index);
+      } else {
+        this.siftDown(index);
+      }
+    }
+
+    return true;
+  }
+
+  /**
    * Return all jobs in the queue as an array.
    * The array may not be fully sorted — only the root is guaranteed to be the minimum.
    */

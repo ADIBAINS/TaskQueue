@@ -31,7 +31,10 @@ startWorker(config, async (job: Job) => {
 
   const validOps = ['aggregate', 'transform', 'validate', 'export', 'cleanup'];
   if (!validOps.includes(operation)) {
-    return { success: false, error: `Unknown operation: ${operation}. Valid: ${validOps.join(', ')}` };
+    return {
+      success: false,
+      error: `Unknown operation: ${operation}. Valid: ${validOps.join(', ')}`,
+    };
   }
 
   const processingTime = 200 + Math.random() * 800;
@@ -94,7 +97,7 @@ startWorker(config, async (job: Job) => {
 
       const recordsChecked = Math.floor(Math.random() * 100000) + 1000;
       const invalidRecords = Math.floor(recordsChecked * (Math.random() * 0.05));
-      const passRate = ((recordsChecked - invalidRecords) / recordsChecked * 100).toFixed(2);
+      const passRate = (((recordsChecked - invalidRecords) / recordsChecked) * 100).toFixed(2);
 
       return {
         success: true,
