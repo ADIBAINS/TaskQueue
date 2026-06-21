@@ -1,0 +1,13 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api-gateway:3000
+}
+
+{$WS_DOMAIN} {
+	reverse_proxy notifier:3400
+}

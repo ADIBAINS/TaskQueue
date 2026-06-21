@@ -105,7 +105,7 @@ procedure.
 - [Operations](docs/OPERATIONS.md) — metrics, logs, tracing, backups, DLQ handling, and
   operational procedures
 - [Deployment](docs/DEPLOYMENT.md) — Docker images, Helm, Kustomize, external dependencies,
-  CI/CD, secrets, and production readiness
+  single-VM public demo, CI/CD, secrets, and production readiness
 
 ## Common development commands
 
@@ -132,6 +132,20 @@ pnpm taskqueue --help
 | Prometheus | http://localhost:9090  | Local metrics                             |
 | Jaeger     | http://localhost:16686 | Traces when `OTLP_ENDPOINT` is configured |
 | WebSocket  | ws://localhost:3400    | Job update subscriptions                  |
+
+## Public demo deployment
+
+The recommended demo deployment is one Ubuntu VM running
+`docker-compose.production.yml`. Caddy exposes only the HTTPS API and WebSocket domains;
+Kafka, Redis, PostgreSQL, metrics, Grafana, Prometheus, and Jaeger remain private.
+
+```bash
+/opt/taskqueue/deploy/scripts/deploy.sh <commit-sha>
+```
+
+GitHub Actions builds immutable GHCR images and can deploy them over SSH with automatic
+health verification and rollback. See [Deployment](docs/DEPLOYMENT.md) for host
+provisioning, DNS, secrets, backups, firewall rules, and required GitHub secrets.
 
 ## Repository layout
 

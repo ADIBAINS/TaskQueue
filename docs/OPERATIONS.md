@@ -164,6 +164,10 @@ pg_restore --clean --if-exists --dbname="$DATABASE_URL" taskqueue.dump
 
 Test restores regularly.
 
+For the single-VM deployment, `deploy/scripts/backup-postgres.sh` creates compressed dumps
+in `/var/backups/taskqueue`. The included systemd timer runs nightly. These local backups
+must also be copied to encrypted off-host storage.
+
 ### Redis
 
 Redis contains active queues, delayed jobs, locks, cached states, idempotency records, and
@@ -180,6 +184,33 @@ single-broker setup is not a production backup strategy.
 Scheduler disconnects its consumer and closes timers on SIGTERM. Workers stop heartbeat and
 reclaimer timers, but active work-loop shutdown is not fully drain-aware. Set a sufficient
 Kubernetes termination grace period and test interruption behavior for long-running jobs.
+
+## Single-VM deployment commands
+
+```bash
+cd /opt/taskqueue
+
+# Current status
+docker compose --env-file .env.production \
+  -f docker-compose.production.yml ps
+
+# Follow application logs
+docker compose --env-file .env.production \
+  -f docker-compose.production.yml logs -f \
+  api-gateway scheduler state-manager notifier
+
+# Deploy an immutable tag
+deploy/scripts/deploy.sh <commit-sha>
+
+# Roll back
+deploy/scripts/rollback.sh
+
+# Backup now
+deploy/scripts/backup-postgres.sh
+```
+
+Container logs use Docker's `json-file` driver with a 10 MB or 20 MB maximum file size and
+five retained files per container.
 
 ## Incident checklist
 

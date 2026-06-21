@@ -1,0 +1,451 @@
+x-application-environment: &application-environment
+  KAFKA_BROKERS: kafka:9092
+  REDIS_HOST: redis
+  REDIS_PORT: '6379'
+  DATABASE_URL: postgresql://taskqueue:${POSTGRES_PASSWORD}@postgres:5432/taskqueue
+  JWT_SECRET: ${JWT_SECRET}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  NODE_ENV: production
+  OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+
+x-application-service: &application-service
+  restart: unless-stopped
+  networks:
+    - taskqueue
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: '5'
+
+x-application-dependencies: &application-dependencies
+  kafka-init:
+    condition: service_completed_successfully
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ['CMD', 'nc', '-z', 'localhost', '2181']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-168}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ['CMD', 'kafka-broker-api-versions', '--bootstrap-server', 'localhost:9092']
+      interval: 15s
+      timeout: 10s
+      retries: 15
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: '5'
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.0
+    restart: 'no'
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -e
+        for topic in job.submitted job.scheduled job.assigned job.completed job.failed job.state-change; do
+          kafka-topics --create --if-not-exists \
+            --bootstrap-server kafka:9092 \
+            --topic "$$topic" \
+            --partitions 3 \
+            --replication-factor 1
+        done
+    networks:
+      - taskqueue
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: taskqueue
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: taskqueue
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U taskqueue -d taskqueue']
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  migrate:
+    image: ${IMAGE_REPOSITORY}/state-manager:${IMAGE_TAG}
+    restart: 'no'
+    environment: *application-environment
+    command: ['node', 'services/state-manager/dist/run-migrate.js']
+    depends_on: *application-dependencies
+    networks:
+      - taskqueue
+    profiles:
+      - tools
+
+  api-gateway:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/api-gateway:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      PORT: '3000'
+    depends_on: *application-dependencies
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.75
+
+  scheduler:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/scheduler:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      METRICS_PORT: '3200'
+    depends_on: *application-dependencies
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3200/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.75
+
+  state-manager:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/state-manager:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      METRICS_PORT: '3300'
+    depends_on: *application-dependencies
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3300/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.75
+
+  notifier:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/notifier:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      PORT: '3400'
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "const s=require('net').connect(3400,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 384m
+    cpus: 0.5
+
+  metrics-exporter:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/metrics-exporter:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      PORT: '3500'
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3500/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 256m
+    cpus: 0.35
+
+  worker-email:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/worker-email:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      MAX_CONCURRENCY: ${EMAIL_MAX_CONCURRENCY:-5}
+      METRICS_PORT: '3600'
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3600/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 384m
+    cpus: 0.5
+
+  worker-image:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/worker-image:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      MAX_CONCURRENCY: ${IMAGE_MAX_CONCURRENCY:-3}
+      METRICS_PORT: '3601'
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3601/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.75
+
+  worker-data:
+    <<: *application-service
+    image: ${IMAGE_REPOSITORY}/worker-data:${IMAGE_TAG}
+    environment:
+      <<: *application-environment
+      MAX_CONCURRENCY: ${DATA_MAX_CONCURRENCY:-8}
+      METRICS_PORT: '3602'
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:3602/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.75
+
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+    ports:
+      - '${OPS_BIND_IP:-127.0.0.1}:9090:9090'
+    volumes:
+      - ./deploy/prometheus.production.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      scheduler:
+        condition: service_healthy
+      state-manager:
+        condition: service_healthy
+      metrics-exporter:
+        condition: service_healthy
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    ports:
+      - '${OPS_BIND_IP:-127.0.0.1}:3001:3000'
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    depends_on:
+      - prometheus
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    restart: unless-stopped
+    ports:
+      - '${OPS_BIND_IP:-127.0.0.1}:16686:16686'
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      API_DOMAIN: ${API_DOMAIN}
+      WS_DOMAIN: ${WS_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      notifier:
+        condition: service_healthy
+    networks:
+      - taskqueue
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+
+networks:
+  taskqueue:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  caddy-data:
+  caddy-config:

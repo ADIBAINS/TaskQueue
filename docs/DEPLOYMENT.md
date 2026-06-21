@@ -3,6 +3,187 @@
 TaskQueue includes a reusable multi-stage Dockerfile, a Helm chart, raw Kubernetes
 manifests with Kustomize overlays, and a GitHub Actions workflow.
 
+## Recommended public demo: one Ubuntu VM
+
+For the current application, the recommended public-demo deployment is one Ubuntu VM
+running `docker-compose.production.yml`.
+
+Recommended minimum:
+
+- Ubuntu 24.04 LTS
+- 4 vCPU
+- 8 GB RAM
+- 80 GB SSD
+- A non-root deployment user
+- Two DNS records:
+  - `api.example.com` for the REST API
+  - `ws.example.com` for WebSockets
+
+This model keeps Kafka, Redis, PostgreSQL, metrics, and dashboards on a private Docker
+network while Caddy exposes only HTTPS API and WebSocket endpoints.
+
+### 1. Point DNS at the server
+
+Create A/AAAA records for the API and WebSocket names before the first deployment. Caddy
+must be able to complete ACME validation over ports 80 and 443.
+
+### 2. Provision the host
+
+Copy the repository's provisioning script to the server and run it as root:
+
+```bash
+DEPLOY_USER=deploy sudo -E bash deploy/scripts/provision-ubuntu.sh
+```
+
+The script:
+
+- Installs Docker Engine and Compose from Docker's Ubuntu repository.
+- Installs rsync and automatic security updates.
+- Creates the deployment user if necessary.
+- Creates `/opt/taskqueue` and `/var/backups/taskqueue`.
+- Enables UFW and permits only SSH, HTTP, HTTPS, and HTTP/3.
+
+Log out and reconnect after provisioning so Docker group membership is applied.
+
+### 3. Create the production environment
+
+On the server:
+
+```bash
+cd /opt/taskqueue
+cp deploy/.env.production.example .env.production
+chmod 600 .env.production
+
+openssl rand -hex 32 # POSTGRES_PASSWORD
+openssl rand -hex 32 # JWT_SECRET
+openssl rand -hex 32 # GRAFANA_ADMIN_PASSWORD
+```
+
+Edit `.env.production`:
+
+```dotenv
+IMAGE_REPOSITORY=ghcr.io/OWNER/REPOSITORY
+IMAGE_TAG=<commit-sha>
+API_DOMAIN=api.example.com
+WS_DOMAIN=ws.example.com
+ACME_EMAIL=ops@example.com
+POSTGRES_PASSWORD=<random-hex>
+JWT_SECRET=<random-hex>
+GRAFANA_ADMIN_PASSWORD=<random-hex>
+```
+
+`IMAGE_REPOSITORY` is the path before the service suffix. The Compose stack pulls images
+such as `${IMAGE_REPOSITORY}/api-gateway:${IMAGE_TAG}`.
+
+### 4. Perform the first deployment
+
+Copy these repository paths to `/opt/taskqueue`:
+
+```text
+docker-compose.production.yml
+deploy/
+config/
+```
+
+If GHCR packages are private:
+
+```bash
+printf '%s' "$GHCR_TOKEN" | \
+  docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+```
+
+Deploy an immutable image tag:
+
+```bash
+chmod +x /opt/taskqueue/deploy/scripts/*.sh
+/opt/taskqueue/deploy/scripts/deploy.sh <commit-sha>
+```
+
+The deployment script:
+
+1. Saves the previous image tag.
+2. Pulls application and infrastructure images.
+3. Starts PostgreSQL, Redis, Kafka, and Jaeger.
+4. Runs database migrations.
+5. Starts application services, Prometheus, Grafana, and Caddy.
+6. Polls the public HTTPS health endpoint.
+7. Restores the previous image tag when health verification fails.
+
+Migrations are not automatically reversed during rollback. Schema changes must remain
+backward compatible with the previous application release.
+
+### 5. Verify public and private exposure
+
+Public:
+
+```bash
+curl https://api.example.com/health
+```
+
+Configure the CLI:
+
+```bash
+taskqueue profile use demo
+taskqueue config set api-url https://api.example.com
+taskqueue config set ws-url wss://ws.example.com
+taskqueue auth token '<jwt>'
+taskqueue health
+```
+
+Operational tools bind to `127.0.0.1` and are available through an SSH tunnel:
+
+```bash
+ssh \
+  -L 3001:127.0.0.1:3001 \
+  -L 9090:127.0.0.1:9090 \
+  -L 16686:127.0.0.1:16686 \
+  deploy@server
+```
+
+Then open:
+
+- Grafana: http://localhost:3001
+- Prometheus: http://localhost:9090
+- Jaeger: http://localhost:16686
+
+Do not publish ports 2181, 5432, 6379, 9092, 29092, 3001, 9090, 16686, or service metrics
+ports through the cloud firewall.
+
+### 6. Enable nightly backups
+
+After deployment assets exist on the server:
+
+```bash
+sudo cp deploy/systemd/taskqueue-backup.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now taskqueue-backup.timer
+systemctl list-timers taskqueue-backup.timer
+```
+
+Backups are written to `/var/backups/taskqueue`, compressed, mode `0600`, and retained for
+seven days by default. Copy them to off-host storage for actual disaster recovery.
+
+Test a backup immediately:
+
+```bash
+sudo systemctl start taskqueue-backup.service
+sudo journalctl -u taskqueue-backup.service
+```
+
+### 7. Manual rollback
+
+Rollback to the automatically recorded previous tag:
+
+```bash
+/opt/taskqueue/deploy/scripts/rollback.sh
+```
+
+Or specify a known image tag:
+
+```bash
+/opt/taskqueue/deploy/scripts/rollback.sh <commit-sha>
+```
+
 ## Deployment model
 
 The supplied deployment assets install TaskQueue application workloads only. They assume
@@ -233,29 +414,49 @@ Keep the Scheduler at one replica unless leader election or queue partitioning i
 
 ## CI/CD workflow
 
-On pull requests:
+The workflow in `.github/workflows/ci-cd.yml` targets the single-VM demo deployment.
+
+On pull requests and pushes:
 
 1. Install dependencies.
 2. Type-check.
 3. Run tests.
+4. Run formatting checks.
+5. Build every workspace package.
+6. Validate the production Compose file.
 
 On pushes to `main`:
 
-1. Run validation.
-2. Build and push eight service images to GHCR.
-3. Trigger an ArgoCD staging sync.
-4. Trigger production sync after the configured GitHub environment gate.
+1. Build and push eight service images to GHCR with the commit SHA and `latest`.
+2. Upload production Compose, Caddy, monitoring, and deployment scripts to the VM.
+3. Authenticate the VM to GHCR.
+4. Run the health-checked deployment script with the immutable SHA.
 
 Required GitHub configuration:
 
-- Package write permission for `GITHUB_TOKEN`
-- `ARGOCD_URL`
-- `ARGOCD_TOKEN`
-- ArgoCD applications named `taskqueue-staging` and `taskqueue-production`
+| Secret             | Purpose                               |
+| ------------------ | ------------------------------------- |
+| `DEMO_HOST`        | VM hostname or IP                     |
+| `DEMO_USER`        | Deployment user, normally `deploy`    |
+| `DEMO_SSH_PORT`    | SSH port; use `22` when unchanged     |
+| `DEMO_SSH_KEY`     | Private deploy key                    |
+| `DEMO_KNOWN_HOSTS` | Trusted `known_hosts` line for the VM |
+| `GHCR_USERNAME`    | Account used by the VM to pull images |
+| `GHCR_TOKEN`       | Token with `read:packages`            |
 
-The workflow only triggers ArgoCD. It does not update Git manifests with the new SHA.
-Configure ArgoCD Image Updater or another image-tag promotion mechanism, otherwise the
-cluster may continue using the tag declared in Git.
+Create a protected GitHub environment named `demo` to require approval or restrict the
+deployment branch. Add repository variable `ENABLE_DEMO_DEPLOY=true` only after the VM,
+DNS, server environment file, and deployment secrets are configured. Until then, image
+builds run and the VM deployment job is skipped.
+
+Generate `DEMO_KNOWN_HOSTS` from a trusted network and verify its fingerprint before saving
+it:
+
+```bash
+ssh-keyscan -p 22 server.example.com
+```
+
+The server's `/opt/taskqueue/.env.production` is never uploaded or replaced by CI.
 
 ## Production readiness checklist
 
